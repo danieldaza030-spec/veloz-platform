@@ -1,0 +1,22 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "FullAccessVelozLayerBuckets",
+      "Effect": "Allow",
+      "Action": [
+        "s3:*"
+      ],
+      "Resource": [
+        "arn:aws:s3:::bronze-veloz",
+        "arn:aws:s3:::bronze-veloz/*",
+        "arn:aws:s3:::silver-veloz",
+        "arn:aws:s3:::silver-veloz/*",
+        "arn:aws:s3:::gold-veloz",
+        "arn:aws:s3:::gold-veloz/*",
+        "arn:aws:s3:::raw-incoming-data",
+        "arn:aws:s3:::raw-incoming-data/*"
+      ]
+    }
+  ]
+}

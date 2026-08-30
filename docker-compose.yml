@@ -1,0 +1,437 @@
+# Local-dev Airflow, LocalExecutor. No Redis/Celery workers: LocalExecutor runs
+# tasks as subprocesses of the scheduler container, which is enough for a
+# one-person data team (G5) and lets Spark/Delta run in-process without a
+# separate cluster. Structure follows Apache's reference docker-compose.yaml,
+# trimmed to what this project needs (no flower, no Celery worker — LocalExecutor
+# doesn't use them). Airflow 3 splits the webserver into a generic api-server and
+# moves DAG parsing out of the scheduler into its own dag-processor service —
+# both are required now, unlike 2.x where the scheduler bundled DAG parsing.
+# The triggerer is kept for parity with the official reference and because
+# future deferrable-operator work (e.g. streaming) may need it.
+x-airflow-common: &airflow-common
+  build:
+    context: ./docker/airflow
+    dockerfile: Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    # Local dev only: unset Fernet key means connection/variable secrets are
+    # stored unencrypted. Fine on localhost, not something to carry to a real
+    # deployment.
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # Airflow 3: tasks/workers no longer talk to the metadata DB directly —
+    # they call the execution API on the api-server. Same local-dev-only
+    # insecurity posture as the empty FERNET_KEY above: a fixed placeholder
+    # secret is fine on localhost, not something to carry to a real deployment.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-apiserver:8080/execution/"
+    AIRFLOW__API_AUTH__JWT_SECRET: "${AIRFLOW__API_AUTH__JWT_SECRET:-airflow_jwt_secret}"
+    AIRFLOW__API_AUTH__JWT_ISSUER: "${AIRFLOW__API_AUTH__JWT_ISSUER:-airflow_local_dev}"
+    # MinIO/s3a credentials. Deliberately the *ingest* (no-delete) role: these
+    # are the standard AWS env vars, so any Spark session built here picks them
+    # up through the default credential provider chain without asking for them.
+    # A bug in a DAG can then overwrite a Delta commit but cannot destroy the
+    # historical files behind it (G2's audit trail, G3's resilience).
+    AWS_ACCESS_KEY_ID: "${MINIO_INGEST_ACCESS_KEY:-veloz-ingest}"
+    AWS_SECRET_ACCESS_KEY: "${MINIO_INGEST_SECRET_KEY:-veloz-ingest-local-dev}"
+    MINIO_ENDPOINT: "http://minio:9000"
+    # The maintenance (full-CRUD) role is passed through under its own names,
+    # never as AWS_*: OPTIMIZE/VACUUM has to name these explicitly and feed them
+    # into a Spark session's fs.s3a.* config, so no scheduled DAG can acquire
+    # delete rights by accident.
+    MINIO_MAINTENANCE_ACCESS_KEY: "${MINIO_MAINTENANCE_ACCESS_KEY:-veloz-maintenance}"
+    MINIO_MAINTENANCE_SECRET_KEY: "${MINIO_MAINTENANCE_SECRET_KEY:-veloz-maintenance-local-dev}"
+    # Spark Standalone cluster (spark-master/spark-worker below), replacing
+    # the Hadoop YARN cluster's HADOOP_CONF_DIR/YARN_CONF_DIR env vars this
+    # block used to set. Standalone has no shared rendered-conf file the way
+    # YARN did — the master's address is just this one URL — so it's an
+    # explicit env var read once by
+    # plugins/spark_session.py's `StandaloneClusterConfig.from_env()`, not a
+    # mounted file. SPARK_WORKER_CPU_LIMIT/MEM_LIMIT are the *same* numbers
+    # driving spark-worker's own deploy.resources.limits below (not
+    # redeclared), so a default executor request built from them can never
+    # ask a worker for more than its own container actually has.
+    SPARK_MASTER_URL: "spark://spark-master:7077"
+    SPARK_WORKER_CPU_LIMIT: "${SPARK_WORKER_CPU_LIMIT:-2}"
+    SPARK_WORKER_MEM_LIMIT: "${SPARK_WORKER_MEM_LIMIT:-4096}"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./data:/opt/airflow/data
+    - ./generators:/opt/airflow/generators
+    - ./config:/opt/airflow/config
+    - ./plugins:/opt/airflow/plugins
+    # Mounted as a subdirectory of plugins/, not its own top-level mount:
+    # Airflow's plugin manager puts ./plugins itself on sys.path (that's why
+    # spark_session.py is importable as bare `spark_session`), so nesting
+    # metadata/ here makes it importable as the `metadata` package (it has
+    # its own __init__.py) with no extra PYTHONPATH wiring.
+    - ./metadata:/opt/airflow/plugins/metadata
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # Object storage standing in for S3 (reference architecture, G4): the Bronze/
+  # Silver/Gold Delta tables live here over s3a://, not on a container's local
+  # disk, so nothing has to be re-pointed when this outgrows one machine.
+  #
+  # Pinned to the last release that still ships the full embedded console:
+  # RELEASE.2025-05-24 deprecated it and moved it to the separate object-browser
+  # project, dropping user/policy management from the UI. That UI is how the
+  # two-role setup below gets eyeballed locally, so the older tag is worth more
+  # here than the newer server internals.
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-veloz-local-dev}"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      # Bind mount rather than a named volume: everything this project writes
+      # stays inspectable on the host under ./data, same as ./data/raw.
+      - ./data/minio:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # One-shot bucket/IAM bootstrap, same shape as airflow-init: runs, sets up,
+  # exits. Two roles instead of one set of root credentials — `veloz-ingest`
+  # (read/write/list, no delete) is what DAGs get by default, `veloz-maintenance`
+  # (full CRUD) exists only for deliberate OPTIMIZE/VACUUM runs, which do need
+  # to remove files.
+  #
+  # `raw-incoming-data` is a fourth bucket, distinct from the three Bronze/
+  # Silver/Gold layer buckets above: it's where the four generators/*.py
+  # scripts (Postgres orders extract, rider events, fulfillment feed,
+  # payments ledger — the emulated upstream systems) land their raw output,
+  # same folder/key layout the local `data/raw/` mirrored before this bucket
+  # existed. Bronze reads *from* this bucket once that layer is built; nothing
+  # here writes into bronze-veloz directly. Hyphenated, not the originally
+  # requested `raw_incoming_data` (underscore) — MinIO/S3 reject underscores
+  # in bucket names outright (DNS-compliant naming, enforced since 2018),
+  # confirmed directly against this same mc image before this name was chosen.
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    # mc's ENTRYPOINT is the binary itself, so it has to be overridden to get a
+    # shell — same trick as airflow-init's `entrypoint: /bin/bash`.
+    entrypoint: /bin/sh
+    # Every step is safe to re-run on each `docker compose up`: `mb
+    # --ignore-existing` skips existing buckets, `policy create` overwrites a
+    # policy of the same name, `user add` overwrites an existing user's secret,
+    # and `policy attach` treats an already-attached policy as success
+    # (mc swallows XMinioAdminPolicyChangeAlreadyApplied).
+    command:
+      - -c
+      - |
+        set -e
+        mc alias set veloz http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+
+        mc mb --ignore-existing veloz/bronze-veloz veloz/silver-veloz veloz/gold-veloz veloz/raw-incoming-data
+
+        mc admin policy create veloz veloz-ingest-no-delete /policies/ingest-policy.json
+        mc admin policy create veloz veloz-maintenance-full /policies/maintenance-policy.json
+
+        mc admin user add veloz "$${MINIO_INGEST_ACCESS_KEY}" "$${MINIO_INGEST_SECRET_KEY}"
+        mc admin policy attach veloz veloz-ingest-no-delete --user "$${MINIO_INGEST_ACCESS_KEY}"
+
+        mc admin user add veloz "$${MINIO_MAINTENANCE_ACCESS_KEY}" "$${MINIO_MAINTENANCE_SECRET_KEY}"
+        mc admin policy attach veloz veloz-maintenance-full --user "$${MINIO_MAINTENANCE_ACCESS_KEY}"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-veloz-local-dev}"
+      MINIO_INGEST_ACCESS_KEY: "${MINIO_INGEST_ACCESS_KEY:-veloz-ingest}"
+      MINIO_INGEST_SECRET_KEY: "${MINIO_INGEST_SECRET_KEY:-veloz-ingest-local-dev}"
+      MINIO_MAINTENANCE_ACCESS_KEY: "${MINIO_MAINTENANCE_ACCESS_KEY:-veloz-maintenance}"
+      MINIO_MAINTENANCE_SECRET_KEY: "${MINIO_MAINTENANCE_SECRET_KEY:-veloz-maintenance-local-dev}"
+    volumes:
+      # Policy documents live as their own files so they stay reviewable and
+      # editable, instead of being JSON embedded in the command above.
+      - ./docker/minio/policies:/policies:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # --- Spark Standalone cluster ---------------------------------------------
+  # A real, shared compute cluster that DAG tasks submit Spark jobs to
+  # (plugins/spark_session.py's `StandaloneSparkSessionFactory`), replacing
+  # the Hadoop YARN cluster this block used to hold (see docs/ADR.md's dated
+  # appendix entry for this move's reasoning — and, plainly, for a
+  # documentation gap this move surfaced rather than silently fixed: the
+  # *previous* YARN divergence was never actually given its own ADR entry or
+  # PROGRESS.md session-log line, despite this file's comments and
+  # docker/hadoop/Dockerfile's header both citing one).
+  #
+  # Built from the same image as the Airflow containers
+  # (./docker/airflow/Dockerfile, which already installs pyspark==3.5.3),
+  # not a bespoke image the way docker/hadoop/Dockerfile was for YARN. That
+  # Dockerfile assumed pip's pyspark wheel ships `sbin/start-master.sh` /
+  # `sbin/start-worker.sh` the way the full Apache Spark tarball does — it
+  # does not (checked directly against this repo's own
+  # .venv/lib/*/site-packages/pyspark/sbin: only spark-daemon.sh,
+  # spark-config.sh and the history-server scripts are present). It does
+  # still ship `bin/spark-class`, the same launcher those wrapper scripts
+  # call internally (`spark-class org.apache.spark.deploy.master.Master` /
+  # `...worker.Worker`), invoked directly below as each container's
+  # foreground command — actually a better fit for Docker than the wrapper
+  # scripts would have been, since those daemonize via `nohup`+pidfile and
+  # exit immediately, leaving nothing for Docker to supervise.
+  #
+  # No shared staging filesystem needed (unlike YARN's `hadoop-yarn-shared`
+  # mount): Standalone mode ships the driver's resolved jars/packages to
+  # executors itself, over the network, as part of normal task submission.
+  # Bronze/Silver/Gold reads/writes are unaffected either way — always
+  # s3a/MinIO, never this cluster's own plumbing.
+
+  # Master: schedules applications across the worker pool and serves the
+  # cluster's web UI. `SPARK_HOME` isn't set anywhere (docker/airflow/
+  # Dockerfile only sets JAVA_HOME) — `bin/spark-class` resolves it itself via
+  # `bin/find-spark-home` (which shells out to `pyspark.find_spark_home`) as
+  # long as it's invoked by its real, resolved path, hence the `python3 -c`
+  # lookup below instead of a hardcoded path that could drift from wherever
+  # pip actually installed the package in this image.
+  spark-master:
+    build:
+      context: ./docker/airflow
+      dockerfile: Dockerfile
+    hostname: spark-master
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        PYSPARK_HOME="$$(python3 -c 'import pyspark, os; print(os.path.dirname(pyspark.__file__))')"
+        exec "$$PYSPARK_HOME/bin/spark-class" org.apache.spark.deploy.master.Master \
+          --host spark-master --port 7077 --webui-port 8080
+    ports:
+      # Host 8090, not Spark's own default 8080: airflow-apiserver already
+      # owns 8080 on this host. The internal container port stays 8080 (the
+      # value plugins/spark_session.py / a browser hitting localhost:8090
+      # never needs to know about) so nothing else has to special-case it.
+      - "${SPARK_MASTER_UI_PORT:-8090}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # Worker pool. Default 5 instances (`deploy.replicas`, honored by
+  # `docker compose up` under Compose V2 with no orchestrator involved — no
+  # `--scale` flag needed, same empirically-confirmed behavior the YARN
+  # NodeManager pool relied on; see PROGRESS.md's session log). To change the
+  # count: edit SPARK_WORKER_COUNT in `.env`, then `docker compose up -d`
+  # again. No host port mapping for the worker UI — same reasoning as
+  # YARN's NodeManagers, which didn't get one either; only the
+  # master/ResourceManager's UI needs to be human-reachable.
+  #
+  # Per-instance CPU/memory are capped via `deploy.resources.limits`, a real
+  # cgroup quota under Compose V2's plain `up` (confirmed empirically with
+  # `docker inspect` for the YARN NodeManager pool; see PROGRESS.md). The
+  # *same* SPARK_WORKER_CPU_LIMIT/MEM_LIMIT values are passed as this
+  # process's own `--cores`/`--memory` flags (baked in by compose's own
+  # `${...}` substitution below, not read from an env var inside the
+  # container), so the worker never advertises more to spark-master than its
+  # own container can actually deliver. `--memory` gets an explicit `m`
+  # suffix: Spark's Worker parses this as a memory string ("4096m"), not a
+  # bare MB integer the way YARN's yarn.nodemanager.resource.memory-mb was —
+  # carrying that bare-number convention over here would silently
+  # misconfigure the worker instead of erroring loudly.
+  spark-worker:
+    build:
+      context: ./docker/airflow
+      dockerfile: Dockerfile
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        PYSPARK_HOME="$$(python3 -c 'import pyspark, os; print(os.path.dirname(pyspark.__file__))')"
+        exec "$$PYSPARK_HOME/bin/spark-class" org.apache.spark.deploy.worker.Worker \
+          spark://spark-master:7077 \
+          --cores "${SPARK_WORKER_CPU_LIMIT:-2}" \
+          --memory "${SPARK_WORKER_MEM_LIMIT:-4096}m" \
+          --webui-port 8081
+    deploy:
+      replicas: ${SPARK_WORKER_COUNT:-5}
+      resources:
+        limits:
+          cpus: "${SPARK_WORKER_CPU_LIMIT:-2}"
+          memory: "${SPARK_WORKER_MEM_LIMIT:-4096}M"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    restart: unless-stopped
+  # --- End Spark Standalone cluster -----------------------------------------
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    # Airflow 3's official pattern: the image's own /entrypoint script handles
+    # db migrate + admin user creation when the _AIRFLOW_DB_MIGRATE/
+    # _AIRFLOW_WWW_USER_CREATE env vars below are set, so this command just
+    # prepares bind-mounted directories/ownership and materializes the config.
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/{logs,dags,plugins,config}
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{logs,dags,plugins,config}
+        /entrypoint airflow version
+        /entrypoint airflow config list
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: "${_AIRFLOW_WWW_USER_USERNAME:-admin}"
+      _AIRFLOW_WWW_USER_PASSWORD: "${_AIRFLOW_WWW_USER_PASSWORD:-admin}"
+    user: "0:0"
+    depends_on: *airflow-common-depends-on
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # JupyterLab for running notebooks under ./notebooks interactively against
+  # the real MinIO stack over s3a://. Builds from the same Dockerfile as the
+  # Airflow containers (docker/airflow/Dockerfile already installs
+  # jupyterlab + mc alongside pyspark/delta-spark) rather than a second image —
+  # notebooks/01_delta_lake_tutorial.ipynb already documents this as the
+  # reason it avoids the host .venv's Python-3.14/pyspark-3.5.3 mismatch, so
+  # this keeps that assumption true instead of diverging from it. Doesn't
+  # extend x-airflow-common: this service has no reason to wait on Postgres,
+  # doesn't need the Airflow-only env vars, or the dags/logs/plugins mounts —
+  # just the same image, MinIO reachability, and the mount paths below.
+  jupyter:
+    build:
+      context: ./docker/airflow
+      dockerfile: Dockerfile
+    # The base image's own ENTRYPOINT is Airflow's /entrypoint script, which
+    # interprets `command:` as an `airflow <subcommand>` invocation — same
+    # reason airflow-init below overrides its entrypoint. Blanking it here so
+    # `command` runs `jupyter lab` directly instead.
+    entrypoint: []
+    command: >
+      jupyter lab --ip=0.0.0.0 --port=8888 --no-browser
+      --ServerApp.token='' --ServerApp.password=''
+      --ServerApp.root_dir=/opt/airflow/notebooks
+    ports:
+      - "8888:8888"
+    environment:
+      MINIO_ENDPOINT: "http://minio:9000"
+      # All four credential pairs are passed through under their own names
+      # (never as AWS_*), so a notebook picks which role to authenticate as
+      # explicitly instead of always inheriting one default the way Spark
+      # sessions built by x-airflow-common services do. Root creds are here
+      # deliberately: notebook 1 uses them on purpose, scoped to a bucket
+      # outside the veloz-ingest/veloz-maintenance IAM policies.
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-veloz-local-dev}"
+      MINIO_INGEST_ACCESS_KEY: "${MINIO_INGEST_ACCESS_KEY:-veloz-ingest}"
+      MINIO_INGEST_SECRET_KEY: "${MINIO_INGEST_SECRET_KEY:-veloz-ingest-local-dev}"
+      MINIO_MAINTENANCE_ACCESS_KEY: "${MINIO_MAINTENANCE_ACCESS_KEY:-veloz-maintenance}"
+      MINIO_MAINTENANCE_SECRET_KEY: "${MINIO_MAINTENANCE_SECRET_KEY:-veloz-maintenance-local-dev}"
+    volumes:
+      # Same container-side paths as x-airflow-common's ./data/./generators/
+      # ./config mounts, for consistency across services; ./notebooks is new.
+      - ./notebooks:/opt/airflow/notebooks
+      - ./data:/opt/airflow/data
+      - ./generators:/opt/airflow/generators
+      - ./config:/opt/airflow/config
+    user: "${AIRFLOW_UID:-50000}:0"
+    # No token/password gate: same local-dev-only posture as this compose
+    # file's other placeholder secrets (empty FERNET_KEY, fixed JWT_SECRET
+    # above) — fine on localhost, not something to carry to a real deployment.
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres-db-volume:

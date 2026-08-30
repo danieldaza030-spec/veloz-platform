@@ -1,0 +1,36 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListVelozLayerBuckets",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+        "s3:ListBucketMultipartUploads"
+      ],
+      "Resource": [
+        "arn:aws:s3:::bronze-veloz",
+        "arn:aws:s3:::silver-veloz",
+        "arn:aws:s3:::gold-veloz",
+        "arn:aws:s3:::raw-incoming-data"
+      ]
+    },
+    {
+      "Sid": "ReadWriteObjectsButNeverDelete",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:ListMultipartUploadParts",
+        "s3:AbortMultipartUpload"
+      ],
+      "Resource": [
+        "arn:aws:s3:::bronze-veloz/*",
+        "arn:aws:s3:::silver-veloz/*",
+        "arn:aws:s3:::gold-veloz/*",
+        "arn:aws:s3:::raw-incoming-data/*"
+      ]
+    }
+  ]
+}
