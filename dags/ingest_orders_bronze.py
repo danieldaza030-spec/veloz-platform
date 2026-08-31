@@ -47,11 +47,11 @@ from __future__ import annotations
 
 import pendulum
 from airflow.sdk import Param, dag, get_current_context, task
+from dag_defaults import BRONZE_DEFAULT_ARGS
 
-RAW_BUCKET = "raw-incoming-data"
-BRONZE_BUCKET = "bronze-veloz"
 ORDERS_RAW_PREFIX = "orders"
 ORDERS_BRONZE_PREFIX = "orders"
+EXTRACT_DATE_COLUMN = "_extract_date"
 
 
 @dag(
@@ -60,10 +60,7 @@ ORDERS_BRONZE_PREFIX = "orders"
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
     tags=["bronze", "orders"],
-    default_args={
-        "retries": 3,
-        "retry_delay": pendulum.duration(minutes=5),
-    },
+    default_args=BRONZE_DEFAULT_ARGS,
     params={
         "date": Param(
             default=None,
@@ -82,7 +79,11 @@ def ingest_orders_bronze():
         # plugins/ is on sys.path for every DAG/task (see spark_session's own
         # bare-name import above); metadata/ is mounted as a subdirectory of
         # it in docker-compose.yml specifically so this import works without
-        # any extra path wiring.
+        # any extra path wiring. application/ and infrastructure/ sit next
+        # to metadata/ at the repo root and follow the same lazy-import
+        # pattern, deferring pyspark-dependent imports out of DAG parse time.
+        from application.bronze_ingestion import BronzeIngestionRequest, ingest_to_bronze
+        from metadata.buckets import Buckets
         from metadata.orders_schema import OrdersSchema
         from spark_session import StandaloneClusterConfig, StandaloneSparkSessionFactory
 
@@ -90,8 +91,8 @@ def ingest_orders_bronze():
         params = context["params"]
         target_date = params["date"] or context.get("ds") or pendulum.now("UTC").to_date_string()
 
-        raw_path = f"s3a://{RAW_BUCKET}/{ORDERS_RAW_PREFIX}/orders_{target_date}.csv"
-        bronze_path = f"s3a://{BRONZE_BUCKET}/{ORDERS_BRONZE_PREFIX}/"
+        raw_path = f"s3a://{Buckets.RAW_INCOMING_DATA}/{ORDERS_RAW_PREFIX}/orders_{target_date}.csv"
+        bronze_path = f"s3a://{Buckets.BRONZE}/{ORDERS_BRONZE_PREFIX}/"
 
         spark = StandaloneSparkSessionFactory(
             app_name="veloz-ingest-orders-bronze",
@@ -99,40 +100,27 @@ def ingest_orders_bronze():
         ).get_session()
 
         try:
-            from pyspark.sql.functions import current_timestamp, input_file_name, lit
+            request = BronzeIngestionRequest(
+                raw_path=raw_path,
+                raw_format="csv",
+                schema=OrdersSchema.RAW,
+                read_options={
+                    "header": "true",
+                    # FAILFAST: fail loudly on any row that doesn't match
+                    # OrdersSchema.RAW instead of coercing it.
+                    "mode": "FAILFAST",
+                },
+                bronze_path=bronze_path,
+                partition_column=EXTRACT_DATE_COLUMN,
+                extract_date=target_date,
+            )
 
             print(f"reading raw orders extract: {raw_path}")
-            raw_df = (
-                spark.read.format("csv")
-                .schema(OrdersSchema.RAW)
-                .option("header", "true")
-                # FAILFAST, not the default PERMISSIVE: a row that doesn't
-                # match OrdersSchema.RAW should fail this task loudly (G3's
-                # "alert when it can't recover"), not land in Bronze as a
-                # silently null-padded row. orders.py doesn't inject
-                # malformed rows the way fulfillment.py's --bad-night does,
-                # so a parse failure here means real, unexpected schema
-                # drift worth stopping on, not routine messiness to absorb.
-                .option("mode", "FAILFAST")
-                .load(raw_path)
+            row_count = ingest_to_bronze(spark, request)
+            print(
+                f"wrote {row_count} rows to {bronze_path} "
+                f"(partition {EXTRACT_DATE_COLUMN}={target_date})"
             )
-
-            bronze_df = raw_df.withColumn("_extract_date", lit(target_date).cast("date")).withColumn(
-                "_ingested_at", current_timestamp()
-            ).withColumn("_source_file", input_file_name())
-
-            row_count = bronze_df.count()
-            print(f"read {row_count} rows for extract_date={target_date}")
-
-            (
-                bronze_df.write.format("delta")
-                .mode("overwrite")
-                .option("replaceWhere", f"_extract_date = '{target_date}'")
-                .partitionBy("_extract_date")
-                .save(bronze_path)
-            )
-
-            print(f"wrote {row_count} rows to {bronze_path} (partition _extract_date={target_date})")
         finally:
             spark.stop()
 

@@ -40,9 +40,11 @@ cancellation possible from any stage before delivery.
 | `updated_at` | timestamp | timestamp of the order's last recorded state change |
 
 **Generator:** `generators/orders.py`. **Output:**
-`s3://raw-incoming-data/orders/orders_<date>.csv` (MinIO), one row per order —
-see the landing-zone note at the end of this document; the generator no
-longer writes to local `data/raw/`.
+`s3://raw-incoming-data/orders/date=<YYYY-MM-DD>/orders_<run_timestamp>.csv`
+(MinIO), one file per 5-minute Airflow run, `<run_timestamp>` being that
+run's `data_interval_start` formatted `%Y%m%dT%H%M%SZ` (UTC, second
+precision) — see the landing-zone note at the end of this document; the
+generator no longer writes to local `data/raw/`.
 
 Status mix: ~78% delivered, ~7% cancelled, rest still in-flight at extract
 time. Rider assigned from the store's own city only.
@@ -97,8 +99,14 @@ same way it would against the real queue. This is ordinary stream behavior,
 not an injected puzzle.
 
 **Generator:** `generators/rider_events.py`. **Output:**
-`s3://raw-incoming-data/rider_events/rider_events_<date>.jsonl` (MinIO) — see
-the landing-zone note at the end of this document.
+`s3://raw-incoming-data/rider_events/date=<YYYY-MM-DD>/rider_events_<run_timestamp>.jsonl`
+(MinIO), same 5-minute cadence and `<run_timestamp>` convention as orders
+above — see the landing-zone note at the end of this document. Orders and
+rider_events will need to be produced by the same DAG run, so a given
+`rider_events_<run_timestamp>.jsonl` always reads the exact
+`orders_<run_timestamp>.csv` its own run produced rather than some other
+run's file landed moments apart; the DAG merge that will guarantee this is
+later work, not designed by this document.
 
 ---
 
@@ -143,10 +151,16 @@ commissions computed for the previous day's completed (delivered) orders.
 | `payment_recorded_at` | timestamp | when Finance's system recorded the payout |
 
 **Generator:** `generators/payments.py`. **Output:**
-`s3://raw-incoming-data/payments/payments_<date>.csv` (MinIO), one row per
-delivered order from that date's orders extract (minus the
-deliberately-missing rows below) — see the landing-zone note at the end of
-this document.
+`s3://raw-incoming-data/payments/date=<YYYY-MM-DD>/payments_<run_timestamp>.csv`
+(MinIO). Payments is a genuine once-a-day settlement file and keeps its
+existing daily cadence — only its key format changes, to the same
+partitioned style as the other sources — still one row per delivered order
+from that date's orders extract (minus the deliberately-missing rows below);
+see the landing-zone note at the end of this document. Because orders now
+lands as many 5-minute files across the day instead of one,
+`payments.py`'s read of that day's orders becomes a glob across
+`orders/date=<date>/orders_*.csv` rather than a single known key — the glob
+implementation itself is later work.
 
 ### Commission policy (Veloz's actual rule — documented, not hidden)
 
@@ -203,25 +217,59 @@ about acceptable variance, same as any real anomaly-detection threshold.
 
 ## Landing zone (MinIO, not local `data/raw/`)
 
-All four generators now write directly to MinIO instead of the local
+All four generators write directly to MinIO instead of the local
 `data/raw/` folder, over S3 via `boto3` (`generators/s3_io.py`), using the
 same `veloz-ingest` (read/write/list, no delete) credentials every other
-ingest-side process in this project runs as. The relative key structure is
-unchanged from the old local layout — only the storage target moved:
+ingest-side process in this project runs as.
 
-| Source | Old local path | New S3 key (same relative structure) |
+Orders, rider events, and payments each move from one bare
+`<source>_<date>.csv` object per day to the date-partitioned key style
+fulfillment already used (`fulfillment/date=<date>/<store_id>.csv`).
+Fulfillment itself is unchanged by this — it's the existing precedent the
+other three now mirror, not something this document touches:
+
+| Source | Old S3 key (one file/day) | New S3 key |
 |---|---|---|
-| Orders | `data/raw/orders/orders_<date>.csv` | `orders/orders_<date>.csv` |
-| Fulfillment | `data/raw/fulfillment/date=<date>/<store_id>.csv` | `fulfillment/date=<date>/<store_id>.csv` |
-| Payments | `data/raw/payments/payments_<date>.csv` | `payments/payments_<date>.csv` |
-| Rider events | `data/raw/rider_events/rider_events_<date>.jsonl` | `rider_events/rider_events_<date>.jsonl` |
+| Orders | `orders/orders_<date>.csv` | `orders/date=<date>/orders_<run_timestamp>.csv` |
+| Rider events | `rider_events/rider_events_<date>.jsonl` | `rider_events/date=<date>/rider_events_<run_timestamp>.jsonl` |
+| Payments | `payments/payments_<date>.csv` | `payments/date=<date>/payments_<run_timestamp>.csv` |
+| Fulfillment | `fulfillment/date=<date>/<store_id>.csv` | unchanged |
 
-Existing local `data/raw/**` files are untouched (historical only — nothing
-new lands there). Each generator's `--output-dir`/`--orders-dir` flags now
-take an S3 key prefix (default: the source name, e.g. `orders`) instead of a
-local directory path; a new `--bucket` flag (default: `raw-incoming-data`)
-selects the target bucket. `payments.py`/`rider_events.py` read that date's
-orders extract the same way, over S3 instead of local disk.
+`<run_timestamp>` is the producing DAG run's `data_interval_start`, formatted
+`%Y%m%dT%H%M%SZ` (UTC, second precision) — not the wall-clock time the file
+happened to be written. Orders and rider_events run on a 5-minute Airflow
+schedule all day, so each `date=<date>/` partition accumulates roughly 288
+objects by end of day, one per run; payments and fulfillment stay on their
+existing daily cadence and each still write exactly one object per
+`date=<date>/` partition — only the key format changed for them, not the
+frequency.
+
+This scheme is adopted uniformly for three reasons:
+
+- **Idempotent by DagRun.** Keying the object by `data_interval_start`
+  rather than wall-clock write time means a retried or backfilled run
+  overwrites its own prior attempt's object instead of producing a
+  duplicate — the same guarantee Airflow's retry semantics already assume
+  elsewhere in this project.
+- **Globable by date.** A `date=<date>/` prefix lets any downstream reader
+  (Bronze ingestion, an ad hoc backfill, payments' own orders read) glob an
+  entire day's objects without needing to know how many runs produced them
+  or at what times.
+- **Mirrors fulfillment's existing style.** Fulfillment already proved this
+  partitioning scheme works on this platform; extending it to the other
+  three sources leaves one landing-zone convention instead of two, which is
+  one less thing to explain in Bronze ingestion.
+
+Existing local `data/raw/**` files remain untouched (historical only —
+nothing new lands there). Each generator's `--output-dir`/`--orders-dir`
+flags still take an S3 key prefix (default: the source name, e.g. `orders`)
+instead of a local directory path; the `--bucket` flag (default:
+`raw-incoming-data`) is unchanged. `payments.py` now reads that day's orders
+by globbing `orders/date=<date>/orders_*.csv` instead of a single known key,
+since orders no longer lands as one file per day (see the payments section
+above); `rider_events.py` reads the exact `orders_<run_timestamp>.csv` its
+own DAG run produced, once orders and rider_events are merged into a single
+DAG (later work — see the rider events section above).
 
 **Open issue, not yet resolved:** MinIO (and real AWS S3) reject
 `raw-incoming-data` as a bucket name outright — `mc mb` fails with "Bucket
@@ -267,18 +315,27 @@ without editing the generator itself:
 | `rider_events.py` | `--min-pings` / `--max-pings` | `2` / `5` | |
 | `rider_events.py` | `--location-jitter-degrees` | `0.05` | |
 
-All four generator DAGs run on their own independent daily cron — deliberately
-no Airflow Asset/event coupling between them, since these DAGs simulate
-separate upstream systems and a real upstream doesn't notify your pipeline
-when another upstream's extract has landed. `generate_orders` runs at 01:00
-UTC; `generate_payments` (01:15) and `generate_rider_events` (01:20) are
-offset late enough after it to normally find that day's `orders_<date>.csv`
-already there, but that's a scheduling convenience, not a guarantee — the
-generators' existing `FileNotFoundError` (unchanged) is the real backstop for
-that file still being missing when they run (a late/failed orders run, or a
-manual out-of-band trigger naming a different date). `generate_fulfillment`
-has no dependency on orders at all (it doesn't read the orders extract) and
-runs on its own cron (01:05 UTC).
+All four generator DAGs currently run on their own independent daily cron —
+deliberately no Airflow Asset/event coupling between them, since these DAGs
+simulate separate upstream systems and a real upstream doesn't notify your
+pipeline when another upstream's extract has landed. Under the landing-zone
+scheme above, orders and rider_events move to a 5-minute schedule that runs
+all day instead of a single daily run, and — because rider_events must read
+the exact orders file its own run produced (see the rider events section
+above) — `generate_orders` and `generate_rider_events` will need to be
+consolidated into a single DAG run rather than two independently-timed ones;
+that DAG merge is later work, not implemented by this document. Payments and
+fulfillment are unaffected by that change and keep their existing independent
+daily crons:
+`generate_payments` (01:15 UTC) still runs late enough after orders' day to
+normally find that day's `orders/date=<date>/` partition already populated
+across its 5-minute files, but that's a scheduling convenience, not a
+guarantee — the generators' existing `FileNotFoundError` (unchanged) is the
+real backstop for that partition still being incomplete when payments runs
+(a late/failed orders run, or a manual out-of-band trigger naming a
+different date). `generate_fulfillment` has no dependency on orders at all
+(it doesn't read the orders extract) and stays on its own daily cron (01:05
+UTC).
 
 ---
 

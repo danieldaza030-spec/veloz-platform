@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import io
 import os
+from datetime import datetime
 
 import boto3
 import pandas as pd
@@ -27,6 +28,32 @@ import pandas as pd
 # Fixed by the engineer's instruction — this is the raw landing zone bucket,
 # distinct from bronze-veloz/silver-veloz/gold-veloz (see docker-compose.yml).
 DEFAULT_BUCKET = "raw-incoming-data"
+
+# Shared landing-zone key convention: a run_timestamp is a producing run's
+# data_interval_start, formatted UTC at second precision, used by every
+# generator that lands one object per run (e.g. orders.py, rider_events.py)
+# to name that object under its date=<date>/ partition.
+RUN_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+
+# Every window-scoped generator (orders.py, rider_events.py) runs on this
+# same cadence, so a full day accumulates 1440 / WINDOW_MINUTES objects
+# under one date=<date>/ partition (see docs/data-sources.md).
+WINDOW_MINUTES = 5
+
+
+def floor_to_window(moment: datetime, window_minutes: int = WINDOW_MINUTES) -> datetime:
+    """Floors a timestamp down to the start of its window_minutes-wide window.
+
+    Args:
+        moment: The timestamp to floor.
+        window_minutes: Width of the window in minutes.
+
+    Returns:
+        moment with its minute rounded down to the nearest window boundary
+        and seconds/microseconds zeroed.
+    """
+    floored_minute = (moment.minute // window_minutes) * window_minutes
+    return moment.replace(minute=floored_minute, second=0, microsecond=0)
 
 
 def get_s3_client():
@@ -74,3 +101,31 @@ def write_csv(df: pd.DataFrame, bucket: str, key: str) -> None:
 def write_text(bucket: str, key: str, text: str) -> None:
     """Writes raw text (e.g. JSON Lines, hand-built CSV) to S3/MinIO."""
     get_s3_client().put_object(Bucket=bucket, Key=key, Body=text.encode("utf-8"))
+
+
+def list_keys(bucket: str, prefix: str) -> list[str]:
+    """Lists every object key under a bucket+prefix.
+
+    Used by generators that need to glob a date partition now landing as
+    many objects (e.g. rider_events.py's day-level orders fallback) instead
+    of a single known key. Uses the `list_objects_v2` paginator so a prefix
+    with more than one page of objects (>1000, S3's per-response cap) is
+    still listed in full rather than silently truncated.
+
+    Args:
+        bucket: bucket to list, e.g. DEFAULT_BUCKET.
+        prefix: key prefix to filter on, e.g. `"orders/date=2026-08-27/"`.
+
+    Returns:
+        Every matching object key as a plain string, sorted for
+        deterministic output. Empty if no keys match the prefix.
+    """
+    client = get_s3_client()
+    paginator = client.get_paginator("list_objects_v2")
+
+    keys: list[str] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append(obj["Key"])
+
+    return sorted(keys)
