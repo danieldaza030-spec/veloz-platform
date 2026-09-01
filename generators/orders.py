@@ -50,7 +50,7 @@ ORDER_TOTAL_RANGE = (8.0, 65.0)  # plausible quick-commerce basket size, USD-equ
 
 # Today's implicit daily total (the old --num-orders default), now the day's
 # aggregate target that HOURLY_VOLUME_MULTIPLIERS spreads across windows.
-DEFAULT_DAILY_TARGET_ORDERS = 6000
+DEFAULT_DAILY_TARGET_ORDERS = 50_000_000
 
 # Relative demand by hour-of-day (index 0 = 00:00, 23 = 23:00), shaping a
 # quick-commerce day: near-zero overnight (stores are effectively closed,

@@ -1,15 +1,14 @@
-"""Triggers `generators/rider_events.py` to produce a day's rider event stream.
+"""Triggers `generators/rider_events.py` to produce rider events for the current 5-minute window.
 
-`rider_events.py` reads that same date's `orders_<date>.csv` (produced by
+`rider_events.py` reads that same 5-minute window's `orders_*.csv` (produced by
 `generate_orders`) and raises FileNotFoundError if it's missing. Deliberately
 no Asset dependency on `generate_orders` here: this DAG simulates a separate
 upstream system (the rider app's event stream), and a real upstream doesn't
 get notified when another upstream's extract has landed — it runs on its own
-schedule. So this DAG runs on its own daily cron, offset late enough after
-`generate_orders`' 01:00 UTC run to normally find that day's file already
-there; the generator's own FileNotFoundError is the backstop for the case
-where it isn't (e.g. an orders run that's late, failed, or a manual
-out-of-band trigger naming a different date).
+schedule. Both `generate_orders` and `generate_rider_events` run every 5 minutes
+to produce their respective windows; the generator's own FileNotFoundError is
+the backstop for the case where a paired orders file isn't there yet (e.g. an
+orders run that failed or is delayed).
 
 Params expose the generator's tunable knobs, including ping count and
 location jitter radius, which were module-level constants in
@@ -59,7 +58,7 @@ def _run_generator(script: str, args: list[str]) -> None:
 
 @dag(
     dag_id="generate_rider_events",
-    schedule="20 1 * * *",  # 01:20 UTC daily — offset after generate_orders' 01:00 run, own cron
+    schedule="*/5 * * * *",  # Every 5 minutes, paired with generate_orders
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
     tags=["infra", "generator"],
@@ -97,14 +96,26 @@ def generate_rider_events():
     def run() -> None:
         context = get_current_context()
         params = context["params"]
-        # context["ds"] is only populated for runs with a logical_date/data
-        # interval (cron-scheduled runs). Manual triggers lack a
-        # logical_date, so fall back to today's UTC date — the same default
-        # rider_events.py itself uses when --date is omitted.
-        target_date = params["date"] or context.get("ds") or pendulum.now("UTC").to_date_string()
+        interval_start = context.get("data_interval_start")
+        if interval_start is not None:
+            window_start = interval_start.in_timezone("UTC")
+        else:
+            window_start = pendulum.now("UTC").start_of("minute")
+        if params["date"]:
+            target_date = pendulum.parse(params["date"]).date()
+            window_start = window_start.set(
+                year=target_date.year,
+                month=target_date.month,
+                day=target_date.day,
+            )
+        target_date = window_start.to_date_string()
+        run_timestamp = window_start.strftime("%Y%m%dT%H%M%SZ")
+        orders_key = f"{ORDERS_PREFIX}/date={target_date}/orders_{run_timestamp}.csv"
 
         args = [
             "--date", target_date,
+            "--run-timestamp", run_timestamp,
+            "--orders-key", orders_key,
             "--seed", str(params["seed"]),
             "--bucket", RAW_BUCKET,
             "--orders-dir", ORDERS_PREFIX,

@@ -115,9 +115,15 @@ def generate_payments():
         # logical_date, so fall back to today's UTC date — the same default
         # payments.py itself uses when --date is omitted.
         target_date = params["date"] or context.get("ds") or pendulum.now("UTC").to_date_string()
+        interval_start = context.get("data_interval_start")
+        if interval_start is not None:
+            run_timestamp = interval_start.in_timezone("UTC").strftime("%Y%m%dT%H%M%SZ")
+        else:
+            run_timestamp = pendulum.now("UTC").strftime("%Y%m%dT%H%M%SZ")
 
         args = [
             "--date", target_date,
+            "--run-timestamp", run_timestamp,
             "--seed", str(params["seed"]),
             "--bucket", RAW_BUCKET,
             "--orders-dir", ORDERS_PREFIX,

@@ -1,14 +1,20 @@
 """Raw schema for the rider app events source.
 
-See `docs/data-sources.md` #2 ("Rider app events — queue stream"). One JSON
-object per line; a stand-in for what would be produced to a Kafka topic
-until that infra is stood up.
+See `docs/data-sources.md` #2 ("Rider app events"). Each row is one
+event on the rider app's stream: either a lifecycle `status_change`
+(mirroring an order's `orders_schema.OrdersSchema.STATUSES`) or a
+`location_ping`. `latitude`/`longitude` are only populated for
+`location_ping` events; `status` is only populated for `status_change`
+events — see `generators/rider_events.py`. Coordinates use `DoubleType`
+rather than `FloatType` (unlike `OrdersSchema.RAW.order_total`):
+geo-coordinates need double precision to avoid rounding error
+compounding across the location history of a single order/rider.
 """
 
 from __future__ import annotations
 
 from pyspark.sql.types import (
-    FloatType,
+    DoubleType,
     StringType,
     StructField,
     StructType,
@@ -17,28 +23,21 @@ from pyspark.sql.types import (
 
 
 class RiderEventsSchema:
-    """Raw schema constants for `rider_events/rider_events_<date>.jsonl`."""
+    """Raw schema constants for `rider_events/rider_events_<run_timestamp>.jsonl`."""
 
     RAW = StructType(
         [
             StructField("event_id", StringType(), False),
             StructField("rider_id", StringType(), False),
-            StructField("order_id", StringType(), True),
+            StructField("order_id", StringType(), False),
             StructField("event_type", StringType(), False),
             StructField("event_time", TimestampType(), False),
-            StructField("latitude", FloatType(), True),
-            StructField("longitude", FloatType(), True),
+            StructField("latitude", DoubleType(), True),
+            StructField("longitude", DoubleType(), True),
             StructField("status", StringType(), True),
         ]
     )
-    """Schema of one JSON line in `rider_events/rider_events_<date>.jsonl`.
+    """Schema of one row in `rider_events/rider_events_<run_timestamp>.jsonl`."""
 
-    `latitude`/`longitude` populate only for `location_ping` events;
-    `status` populates only for `status_change` events.
-    """
-
-    EVENT_TYPES = ["location_ping", "status_change"]
+    EVENT_TYPES = ["status_change", "location_ping"]
     """Valid values of the `event_type` column."""
-
-    STATUS_CHANGE_STATUSES = ["assigned", "picked_up", "delivered"]
-    """Valid values of `status` when `event_type` is `status_change`."""

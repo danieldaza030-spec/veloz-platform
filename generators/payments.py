@@ -24,11 +24,12 @@ from __future__ import annotations
 import argparse
 import random
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pandas as pd
 
-from s3_io import DEFAULT_BUCKET
+from s3_io import DEFAULT_BUCKET, RUN_TIMESTAMP_FORMAT
+from s3_io import list_keys as s3_list_keys
 from s3_io import read_csv as s3_read_csv
 from s3_io import write_csv
 
@@ -180,15 +181,23 @@ def generate_payments(
 
 
 def _load_delivered_orders(bucket: str, orders_prefix: str, target_date: date) -> pd.DataFrame:
-    key = f"{orders_prefix}/orders_{target_date.isoformat()}.csv"
-    try:
-        orders_df = s3_read_csv(bucket, key, parse_dates=["created_at", "delivered_at"])
-    except FileNotFoundError as exc:
+    partition_prefix = f"{orders_prefix}/date={target_date.isoformat()}/"
+    keys = [
+        key
+        for key in s3_list_keys(bucket, partition_prefix)
+        if key.rsplit("/", 1)[-1].startswith("orders_") and key.endswith(".csv")
+    ]
+    if not keys:
         raise FileNotFoundError(
-            f"No orders extract at s3://{bucket}/{key} — generate it first with "
-            f"generators/orders.py --date {target_date.isoformat()} before "
+            f"No orders extracts under s3://{bucket}/{partition_prefix} — generate "
+            f"at least one first with generators/orders.py --run-timestamp "
+            f"<window-start> before "
             f"running payments.py for the same date."
-        ) from exc
+        )
+    orders_df = pd.concat(
+        (s3_read_csv(bucket, key, parse_dates=["created_at", "delivered_at"]) for key in keys),
+        ignore_index=True,
+    )
     return orders_df[orders_df["status"] == "delivered"].reset_index(drop=True)
 
 
@@ -199,6 +208,13 @@ def parse_args() -> argparse.Namespace:
         type=lambda s: datetime.strptime(s, "%Y-%m-%d").date(),
         default=date.today(),
         help="Date whose delivered orders to settle, YYYY-MM-DD (default: today).",
+    )
+    parser.add_argument(
+        "--run-timestamp",
+        type=lambda s: datetime.strptime(s, RUN_TIMESTAMP_FORMAT),
+        default=datetime.now(UTC).replace(tzinfo=None),
+        help="Timestamp used in the output key, formatted "
+        f"{RUN_TIMESTAMP_FORMAT!r} (default: current UTC time).",
     )
     parser.add_argument(
         "--orders-dir",
@@ -264,7 +280,8 @@ def main() -> None:
         lag_stdev_hours=args.lag_stdev_hours,
     )
 
-    key = f"{args.output_dir}/payments_{args.date.isoformat()}.csv"
+    run_timestamp = args.run_timestamp.strftime(RUN_TIMESTAMP_FORMAT)
+    key = f"{args.output_dir}/date={args.date.isoformat()}/payments_{run_timestamp}.csv"
     write_csv(df, args.bucket, key)
 
     missing = len(delivered) - len(df)

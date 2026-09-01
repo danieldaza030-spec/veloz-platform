@@ -16,8 +16,11 @@ rules.
 
 ## Right now
 
-- **Current focus:** the orders Bronze ingestion DAG is built and verified
-  end-to-end. Next up: Bronze for the other three sources, then Silver.
+- **Current focus:** orders and rider_events now generate data every 5 minutes
+  (previously daily). Fulfillment and payments remain daily per business rules.
+  `ingest_orders_bronze` now catches up to that cadence via Asset-based
+  scheduling instead of a daily cron. Next up: Bronze ingestion for
+  fulfillment/payments/rider_events, then Silver.
 - **Currently working on:** nothing in progress.
 - **Blocked on:** nothing.
 - **Next step:** Bronze ingestion for fulfillment/payments/rider_events
@@ -97,6 +100,30 @@ test it, be able to explain it.
 ## Session log
 
 Newest first. One or two lines: what happened, what you decided, what's next.
+
+- **2026-08-31 — switched `ingest_orders_bronze` from a daily cron to
+  Asset-based (event-driven) scheduling.** `generate_orders` now lands one
+  window-file per 5-minute run at `orders/date=<date>/orders_<run_timestamp>.csv`
+  instead of one file per day, so the old `01:10 UTC` cron (waiting on a
+  file that no longer gets written) was stale. Added
+  `infrastructure/s3_new_object_trigger.py`'s `S3NewObjectTrigger`, a custom
+  `BaseEventTrigger` that fires once per newly observed S3 key under a
+  prefix (plain `S3KeyTrigger` is explicitly documented as unsafe for
+  event-driven scheduling — it stays true forever once a key exists, causing
+  infinite re-triggering). `dags/ingest_orders_bronze.py` now declares
+  `ORDERS_RAW_ASSET` watched by that trigger and schedules off it; the task
+  reads the extract date off the triggering Asset event's key (falling back
+  to the `date` param for manual triggers) and re-globs
+  `orders/date=<date>/*.csv` for that day rather than a single file, so the
+  existing `replaceWhere`-per-partition write stays correct and idempotent
+  across repeated per-window triggers. Verified `airflow dags list-import-errors`
+  is clean and the DAG's timetable now reports `Asset`/`Triggered by assets`.
+  Left `generate_orders`/`generate_fulfillment`/`generate_payments`/
+  `generate_rider_events` untouched, per instruction not to touch the raw
+  generators. Fulfillment/payments Bronze ingestion (still daily-cadence
+  sources) unchanged.
+
+- **2026-08-31 — switched orders and rider_events generators to 5-minute cadence** (`dags/generate_orders.py` and `dags/generate_rider_events.py` now use `schedule="*/5 * * * *"` instead of daily crons). Fulfillment and payments remain daily (they're genuine daily exports in the source systems). Ingestion DAGs unchanged — still daily consumers for now. File naming (`orders_<run_timestamp>.csv`, etc.) already works with 5-min granularity via second-precision timestamps in `%Y%m%dT%H%M%SZ` format.
 
 - **2026-08-30 — built and verified the orders Bronze ingestion DAG
   (`dags/ingest_orders_bronze.py`) — normally engineer-owned platform logic

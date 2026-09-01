@@ -71,10 +71,8 @@ class StandaloneClusterConfig:
     executor_cores: int
     executor_memory_mb: int
     # Caps how many total cores a single application may hold across the
-    # whole cluster at once (`spark.cores.max`). Defaulted to exactly one
-    # worker's own core count below, not the whole pool's: a smoke test or
-    # any other single DAG task has no business reserving the entire shared
-    # cluster by default, only what one worker can give it.
+    # whole cluster at once (`spark.cores.max`). It matches the configured
+    # worker pool so Spark can place one executor on each available worker.
     cores_max: int
 
     @classmethod
@@ -89,11 +87,12 @@ class StandaloneClusterConfig:
         """
         worker_cores = int(os.environ.get("SPARK_WORKER_CPU_LIMIT", "2"))
         worker_memory_mb = int(os.environ.get("SPARK_WORKER_MEM_LIMIT", "4096"))
+        worker_count = int(os.environ.get("SPARK_WORKER_COUNT", "5"))
         return cls(
             master_url=os.environ.get("SPARK_MASTER_URL", "spark://spark-master:7077"),
             executor_cores=worker_cores,
             executor_memory_mb=worker_memory_mb,
-            cores_max=worker_cores,
+            cores_max=worker_cores * worker_count,
         )
 
 
