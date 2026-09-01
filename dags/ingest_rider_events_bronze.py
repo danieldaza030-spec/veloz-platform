@@ -58,6 +58,13 @@ RIDER_EVENTS_BRONZE_PREFIX = "rider_events"
 EXTRACT_DATE_COLUMN = "_extract_date"
 DATE_PARTITION_PATTERN = re.compile(r"date=(\d{4}-\d{2}-\d{2})")
 
+# How many workers/cores this DAG's Spark submission requests from the
+# shared Standalone cluster. Defined per-DAG (rather than left to
+# plugins/spark_session.py's env-var defaults) so this job's cluster
+# footprint is visible and tunable at the call site.
+SPARK_WORKER_COUNT = 5
+SPARK_CORES_MAX = 2  # None = derive from SPARK_WORKER_COUNT * per-worker cores (see plugins/spark_session.py)
+
 RIDER_EVENTS_RAW_ASSET = Asset(
     f"s3://{Buckets.RAW_INCOMING_DATA}/{RIDER_EVENTS_RAW_PREFIX}/",
     watchers=[
@@ -135,7 +142,9 @@ def ingest_rider_events_bronze():
 
         spark = StandaloneSparkSessionFactory(
             app_name="veloz-ingest-rider-events-bronze",
-            cluster_config=StandaloneClusterConfig.from_env(),
+            cluster_config=StandaloneClusterConfig.from_env(
+                worker_count=SPARK_WORKER_COUNT, cores_max=SPARK_CORES_MAX
+            ),
         ).get_session()
 
         try:

@@ -76,7 +76,12 @@ class StandaloneClusterConfig:
     cores_max: int
 
     @classmethod
-    def from_env(cls) -> "StandaloneClusterConfig":
+    def from_env(
+        cls,
+        *,
+        worker_count: int | None = None,
+        cores_max: int | None = None,
+    ) -> "StandaloneClusterConfig":
         """Build config from the env vars `docker-compose.yml` sets.
 
         `SPARK_WORKER_CPU_LIMIT`/`SPARK_WORKER_MEM_LIMIT` are read here
@@ -84,15 +89,34 @@ class StandaloneClusterConfig:
         `spark-worker`'s own `deploy.resources.limits` in
         `docker-compose.yml`, so a default executor request built from them
         can never ask a worker for more than its own container actually has.
+
+        `worker_count`/`cores_max` are optional overrides for a calling DAG
+        that wants its Spark submission's cluster footprint defined as a
+        visible constant at the call site instead of the `SPARK_WORKER_COUNT`
+        env-var fallback below.
+
+        Args:
+            worker_count: Number of workers to size the submission for. Falls
+                back to `SPARK_WORKER_COUNT` (default 5) when not given.
+            cores_max: Explicit `spark.cores.max` value. Falls back to
+                `worker_cores * effective worker_count` when not given.
         """
         worker_cores = int(os.environ.get("SPARK_WORKER_CPU_LIMIT", "2"))
         worker_memory_mb = int(os.environ.get("SPARK_WORKER_MEM_LIMIT", "4096"))
-        worker_count = int(os.environ.get("SPARK_WORKER_COUNT", "5"))
+        effective_worker_count = (
+            worker_count
+            if worker_count is not None
+            else int(os.environ.get("SPARK_WORKER_COUNT", "5"))
+        )
         return cls(
             master_url=os.environ.get("SPARK_MASTER_URL", "spark://spark-master:7077"),
             executor_cores=worker_cores,
             executor_memory_mb=worker_memory_mb,
-            cores_max=worker_cores * worker_count,
+            cores_max=(
+                cores_max
+                if cores_max is not None
+                else worker_cores * effective_worker_count
+            ),
         )
 
 
