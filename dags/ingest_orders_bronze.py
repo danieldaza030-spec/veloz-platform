@@ -1,6 +1,7 @@
 """Ingests newly landed raw orders window-files into the Bronze layer.
 
-`generate_orders` (see `dags/generate_orders.py`) now runs every 5 minutes,
+`generate_orders` (the `generate_orders` task in
+`dags/generate_orders_and_rider_events.py`) now runs every 5 minutes,
 landing one object per run at
 `s3a://raw-incoming-data/orders/date=<date>/orders_<run_timestamp>.csv`
 instead of one file per day. This DAG is scheduled off `ORDERS_RAW_ASSET`, an
@@ -65,7 +66,7 @@ DATE_PARTITION_PATTERN = re.compile(r"date=(\d{4}-\d{2}-\d{2})")
 # plugins/spark_session.py's env-var defaults) so this job's cluster
 # footprint is visible and tunable at the call site.
 SPARK_WORKER_COUNT = 5
-SPARK_CORES_MAX = None  # None = derive from SPARK_WORKER_COUNT * per-worker cores (see plugins/spark_session.py)
+SPARK_CORES_MAX = 10  # None = derive from SPARK_WORKER_COUNT * per-worker cores (see plugins/spark_session.py)
 
 ORDERS_RAW_ASSET = Asset(
     f"s3://{Buckets.RAW_INCOMING_DATA}/{ORDERS_RAW_PREFIX}/",

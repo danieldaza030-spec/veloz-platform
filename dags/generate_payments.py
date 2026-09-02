@@ -1,15 +1,16 @@
 """Triggers `generators/payments.py` to produce a day's payments/commissions ledger.
 
-`payments.py` reads that same date's `orders_<date>.csv` (produced by
-`generate_orders`) and raises FileNotFoundError if it's missing. Deliberately
-no Asset dependency on `generate_orders` here: this DAG simulates a separate
-upstream system (Finance's payments ledger), and a real upstream doesn't get
-notified when another upstream's extract has landed — it runs on its own
-schedule. So this DAG runs on its own daily cron, offset late enough after
-`generate_orders`' 01:00 UTC run to normally find that day's file already
-there; the generator's own FileNotFoundError is the backstop for the case
-where it isn't (e.g. an orders run that's late, failed, or a manual
-out-of-band trigger naming a different date).
+`payments.py` reads that same date's `orders_<date>.csv` (produced by the
+`generate_orders` task, now in `dags/generate_orders_and_rider_events.py`)
+and raises FileNotFoundError if it's missing. Deliberately no Asset
+dependency on that DAG here: this DAG simulates a separate upstream system
+(Finance's payments ledger), and a real upstream doesn't get notified when
+another upstream's extract has landed — it runs on its own schedule. So this
+DAG runs on its own daily cron, offset late enough after
+`generate_orders_and_rider_events`' 01:00 UTC run to normally find that
+day's file already there; the generator's own FileNotFoundError is the
+backstop for the case where it isn't (e.g. an orders run that's late,
+failed, or a manual out-of-band trigger naming a different date).
 
 Params expose the generator's tunable knobs, including the wrong-amount/
 missing-payment injection rates and settlement-lag distribution, which were
@@ -60,7 +61,7 @@ def _run_generator(script: str, args: list[str]) -> None:
 
 @dag(
     dag_id="generate_payments",
-    schedule="15 1 * * *",  # 01:15 UTC daily — offset after generate_orders' 01:00 run, own cron
+    schedule="15 1 * * *",  # 01:15 UTC daily — offset after generate_orders_and_rider_events' 01:00 run, own cron
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
     tags=["infra", "generator"],

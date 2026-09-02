@@ -2,7 +2,8 @@
 
 Independent of orders.py — the fulfillment feed only needs the shared store/SKU
 reference data, not that date's orders extract — so this DAG runs on its own
-daily schedule with no Asset dependency on `generate_orders`.
+daily schedule with no Asset dependency on `generate_orders` (now the
+`generate_orders` task in `dags/generate_orders_and_rider_events.py`).
 
 Params expose the generator's tunable knobs, including the --bad-night
 severity, which was previously only togglable on/off, not tunable in degree

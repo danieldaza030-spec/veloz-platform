@@ -1,6 +1,7 @@
 """Ingests newly landed raw rider-event window-files into the Bronze layer.
 
-`generate_rider_events` (see `dags/generate_rider_events.py`) runs every 5
+`generate_rider_events` (the `generate_rider_events` task in
+`dags/generate_orders_and_rider_events.py`) runs every 5
 minutes, landing one JSON Lines object per run at
 `s3a://raw-incoming-data/rider_events/date=<date>/rider_events_<run_timestamp>.jsonl`.
 This DAG is scheduled off `RIDER_EVENTS_RAW_ASSET`, an Airflow Asset watched
@@ -63,7 +64,7 @@ DATE_PARTITION_PATTERN = re.compile(r"date=(\d{4}-\d{2}-\d{2})")
 # plugins/spark_session.py's env-var defaults) so this job's cluster
 # footprint is visible and tunable at the call site.
 SPARK_WORKER_COUNT = 5
-SPARK_CORES_MAX = 2  # None = derive from SPARK_WORKER_COUNT * per-worker cores (see plugins/spark_session.py)
+SPARK_CORES_MAX = 10  # None = derive from SPARK_WORKER_COUNT * per-worker cores (see plugins/spark_session.py)
 
 RIDER_EVENTS_RAW_ASSET = Asset(
     f"s3://{Buckets.RAW_INCOMING_DATA}/{RIDER_EVENTS_RAW_PREFIX}/",

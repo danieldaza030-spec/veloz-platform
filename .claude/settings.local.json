@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -sI --max-time 5 https://www.google.com)",
+      "Bash(docker compose ps *)",
+      "Bash(docker exec *)",
+      "Bash(curl -s http://localhost:8090/json/)",
+      "Bash(python3 -c ' *)",
+      "Bash(xargs -I{} docker exec veloz-platform-minio-1 mc stat {})",
+      "Bash(docker volume *)",
+      "Bash(pip show *)",
+      "Bash(python3 -c \"import airflow; print\\(airflow.__version__\\)\")",
+      "Bash(pip list *)",
+      "Bash(grep -n \"^  [a-z-]*:$\" -A2 /Users/danildazamacias/Documents/proyectos/Veloz/veloz-platform/docker-compose.yml)",
+      "Bash(grep -E \"^  [a-z-]+:$|image:|ports:\")",
+      "Bash(grep *)"
+    ]
+  }
+}
