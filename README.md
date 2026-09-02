@@ -39,150 +39,62 @@ actually rely on:
 
 ```mermaid
 flowchart TB
-    %% ============ EXTERNAL / UPSTREAM ============
-    subgraph EXT["External upstream sources — fixed, fully specified (docs/data-sources.md)"]
+    subgraph SRC["External sources"]
         direction LR
-        ORD["Orders\nPostgres periodic extract\n(created→assigned→picked_up→delivered/cancelled)"]
-        RID["Rider app events\nqueue stream\n(location pings, status changes)"]
-        FUL["Store fulfillment\none CSV/store/day, emailed\n(unreliable: missing/malformed)"]
-        PAY["Payments / commissions\ndaily ledger file\n(settlement-lag pattern)"]
+        ORD["Orders"]
+        RID["Rider events"]
+        FUL["Fulfillment"]
+        PAY["Payments"]
     end
 
-    %% ============ ORCHESTRATION ============
-    subgraph AF["Airflow 3.3.1 — docker-compose, LocalExecutor"]
+    AF["Airflow\norchestration"]
+    SPARKJOB["Airflow Spark task\nsubmits job"]
+    SPARKCLUSTER["Spark Standalone\ncluster"]
+
+    subgraph OUT["Stakeholder outputs"]
         direction LR
-        AFAPI["airflow-apiserver\nUI + REST API + execution API\n:8080"]
-        AFSCHED["airflow-scheduler\nschedules DAG runs,\nAsset/trigger evaluation"]
-        AFDAGP["airflow-dag-processor\nparses DAG files\n(split out of scheduler in Airflow 3)"]
-        AFTRIG["airflow-triggerer\nasync deferred triggers\n(S3NewObjectTrigger for Bronze DAGs)"]
+        OPSVIEW["Ops status view"]
+        FINVIEW["Finance reconciliation"]
     end
 
-    PGDB[("postgres\nAirflow metadata DB\n(NOT a data-lake store —\njust Airflow's own state)")]
-    AFAPI --- PGDB
-    AFSCHED --- PGDB
-    AFDAGP --- PGDB
-    AFTRIG --- PGDB
+    SRC --> AF --> SPARKJOB --> SPARKCLUSTER --> OUT
 
-    %% Generator DAGs simulate the upstream systems, writing raw files into MinIO
-    subgraph GENDAGS["Generator DAGs — simulate upstream systems, built"]
+    subgraph LAKE["MinIO — object storage"]
         direction LR
-        GORD["generate_orders_and_rider_events\nevery 5 min"]
-        GFUL["generate_fulfillment\ndaily"]
-        GPAY["generate_payments\ndaily"]
+        BRONZE[("Bronze\nraw, schema-applied")]
+        SILVER[("Silver\ndeduplicated, reconciled")]
+        GOLD[("Gold\ndashboard-ready")]
+        BRONZE --> SILVER --> GOLD
     end
 
-    ORD -. "emulated by" .-> GORD
-    RID -. "emulated by" .-> GORD
-    FUL -. "emulated by" .-> GFUL
-    PAY -. "emulated by" .-> GPAY
+    SPARKCLUSTER -.-> BRONZE
+    GOLD -.-> OUT
 
-    AFSCHED --> GORD
-    AFSCHED --> GFUL
-    AFSCHED --> GPAY
-
-    %% ============ COMPUTE ============
-    subgraph SPARK["Spark Standalone cluster — shared compute, built"]
-        direction LR
-        SPMASTER["spark-master\nschedules jobs across workers\nUI :8090"]
-        SPWORK["spark-worker x N\n(SPARK_WORKER_COUNT, default 5)\ncapped cores/memory per worker"]
-        SPMASTER --- SPWORK
-    end
-
-    subgraph BRONZEDAGS["Bronze ingestion DAGs — Asset/S3-trigger scheduled"]
-        direction LR
-        IORD["ingest_orders_bronze\ntriggered on new object\nunder orders/, built"]
-        IRID["ingest_rider_events_bronze\ntriggered on new object\nunder rider_events/, built\n(temporary batch stand-in\nfor the streaming design below)"]
-        IFUL["ingest_fulfillment_bronze\nquarantines missing files +\nmalformed rows, built"]
-        IPAY["ingest_payments_bronze\nnot yet built"]
-    end
-
-    AFTRIG -. "watches for new S3 objects" .-> IORD
-    AFTRIG -. "watches for new S3 objects" .-> IRID
-    AFSCHED --> IFUL
-    AFSCHED -.-> IPAY
-
-    IORD --> SPMASTER
-    IRID --> SPMASTER
-    IFUL --> SPMASTER
-    IPAY -.-> SPMASTER
-
-    subgraph KAFKASTREAM["Streaming path — reference design, not yet built"]
-        direction LR
-        KAFKA["Kafka (KRaft) + Kafka UI\nrider-event producer"]
-        SSTREAM["Spark Structured Streaming\ncheckpointed, watermarked\nconsumer"]
-        KAFKA --> SSTREAM
-    end
-
-    RID -. "future producer wiring" .-> KAFKA
-    SSTREAM -. "streaming write, will replace\ningest_rider_events_bronze" .-> SPMASTER
-
-    %% ============ STORAGE HUB ============
-    subgraph MINIO["MinIO — S3-compatible object storage, central storage hub, built"]
-        direction TB
-        RAWBUCKET[("raw-incoming-data\nlanding zone for all 4\ngenerator outputs")]
-        BRONZEBUCKET[("bronze-veloz\nschema-applied,\nappend-only per extract")]
-        SILVERBUCKET[("silver-veloz\ndeduplicated,\nquarantine-clean,\nreconciled")]
-        GOLDBUCKET[("gold-veloz\nreconciliation +\ndashboard-ready aggregates")]
-    end
-
-    GORD -- "writes CSV/JSONL" --> RAWBUCKET
-    GFUL -- "writes CSV" --> RAWBUCKET
-    GPAY -- "writes CSV" --> RAWBUCKET
-
-    SPMASTER -- "reads raw/*, writes\nschema-applied Delta" --> BRONZEBUCKET
-    BRONZEBUCKET -. "Silver DAGs — not yet built\n(dedup, quarantine collapse)" .-> SILVERBUCKET
-    SILVERBUCKET -. "Gold DAGs — not yet built\n(reconciliation, aggregates)" .-> GOLDBUCKET
-
-    %% Two IAM roles enforced at the MinIO layer
-    IAMNOTE["Two IAM roles via minio-init:\nveloz-ingest (read/write/list, no delete) — default for DAGs\nveloz-maintenance (full CRUD) — OPTIMIZE/VACUUM only"]
-    MINIO -.- IAMNOTE
-
-    %% ============ INTERACTIVE / DEV ============
-    subgraph JUP["Jupyter — optional notebook, built"]
-        JLAB["jupyter lab :8888\nsame image as Airflow,\nnotebooks/ against MinIO over s3a://"]
-    end
-    JLAB -- "ad hoc reads/writes\n(root creds, scoped bucket)" --> MINIO
-
-    %% ============ OUTPUTS ============
-    subgraph OUT["Stakeholder-facing outputs — not yet built"]
-        direction LR
-        OPSVIEW["Ops status view (Marcela)\nstore/rider status,\na few minutes' lag"]
-        FINVIEW["Finance reconciliation report\n(Julián) — ready before 8am,\ndiscrepancies flagged, not hidden"]
-    end
-
-    GOLDBUCKET -.-> OPSVIEW
-    GOLDBUCKET -.-> FINVIEW
-
-    %% ============ STYLING ============
     classDef external fill:#fde2e2,stroke:#b91c1c,color:#000
     classDef orchestration fill:#e0f2fe,stroke:#0369a1,color:#000
     classDef compute fill:#dcfce7,stroke:#15803d,color:#000
     classDef storage fill:#fef9c3,stroke:#a16207,color:#000
     classDef output fill:#ede9fe,stroke:#6d28d9,color:#000
-    classDef notbuilt stroke-dasharray: 5 5
 
     class ORD,RID,FUL,PAY external
-    class AFAPI,AFSCHED,AFDAGP,AFTRIG,PGDB,GORD,GFUL,GPAY,IORD,IRID,IFUL orchestration
-    class IPAY orchestration,notbuilt
-    class SPMASTER,SPWORK,JLAB compute
-    class KAFKA,SSTREAM compute,notbuilt
-    class RAWBUCKET,BRONZEBUCKET,IAMNOTE storage
-    class SILVERBUCKET,GOLDBUCKET storage,notbuilt
-    class OPSVIEW,FINVIEW output,notbuilt
+    class AF,SPARKJOB orchestration
+    class SPARKCLUSTER compute
+    class BRONZE,SILVER,GOLD storage
+    class OPSVIEW,FINVIEW output
 ```
 
-This diagram shows every container in the local Docker stack and how data
-moves between them: the four fixed upstream sources (red) are emulated by
-generator DAGs that land raw files in MinIO, Airflow (blue) schedules Spark
-jobs (green) to ingest that data through Bronze → Silver → Gold storage
-layers (yellow), and the Gold layer feeds the Ops and Finance-facing outputs
-(purple). Solid boxes/arrows are built and running today; dashed ones —
-Silver, Gold, the streaming path, and the stakeholder-facing views — are
-designed but not yet built.
+Orders, rider events, fulfillment, and payments (red) come in, Airflow
+(blue) orchestrates the pipeline and submits a Spark job, which the Spark
+Standalone cluster (green) actually processes. Below that flow, MinIO
+(yellow) holds the Bronze → Silver → Gold storage layers: the Spark cluster
+writes into Bronze, and Gold feeds the Ops and Finance-facing outputs
+(purple).
 
-For the full breakdown of each component, the legend, and exactly what's
-built versus designed, see
-[`docs/architecture-diagram.md`](docs/architecture-diagram.md).
+This is the high-level version. For the full container/service topology —
+every Airflow service, the Spark Standalone cluster, exact bucket and IAM
+role names, the streaming path, and what's built versus still designed —
+see [`docs/architecture-diagram.md`](docs/architecture-diagram.md) and
+[`docs/architecture-topology.md`](docs/architecture-topology.md).
 
 ## Quick start
 
