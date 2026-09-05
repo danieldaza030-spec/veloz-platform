@@ -49,7 +49,7 @@ class DeltaBronzeWriter:
 
         Raises:
             ValueError: If `partition_value` contains a single-quote
-                character, which would break out of the quoted literal
+                 character, which would break out of the quoted literal
                 and produce a malformed `replaceWhere` predicate.
         """
         if "'" in partition_value:

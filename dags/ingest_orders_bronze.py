@@ -65,7 +65,7 @@ DATE_PARTITION_PATTERN = re.compile(r"date=(\d{4}-\d{2}-\d{2})")
 # shared Standalone cluster. Defined per-DAG (rather than left to
 # plugins/spark_session.py's env-var defaults) so this job's cluster
 # footprint is visible and tunable at the call site.
-SPARK_WORKER_COUNT = 5
+SPARK_WORKER_COUNT = 2
 SPARK_CORES_MAX = 10  # None = derive from SPARK_WORKER_COUNT * per-worker cores (see plugins/spark_session.py)
 
 ORDERS_RAW_ASSET = Asset(
