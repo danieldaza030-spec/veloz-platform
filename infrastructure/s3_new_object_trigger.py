@@ -14,11 +14,15 @@ keys already present under the prefix at startup, then poll-diffs against that
 in-memory set, so each key can only ever cause one Asset update.
 
 Trade-off accepted deliberately for this scope (G5, one-person team, no extra
-infra): the "already seen" set lives in the triggerer process's memory, not in
-Airflow's metadata DB. A triggerer restart re-baselines to whatever keys exist
-at that moment, so a key that landed in the narrow window between the restart
-and its next poll could be silently absorbed into the new baseline instead of
-firing an event. Bronze ingestion is unaffected either way in the common case
+infra): the "already seen" set lives primarily in the triggerer process's
+memory, not in Airflow's metadata DB. Each poll persists that set — and any
+newly observed keys — to object storage via `persist_s3_keys_snapshot`
+(manifest + per-poll diff, best-effort, never raises), so a human or a future
+recovery job can reconstruct what the trigger saw and when. A triggerer
+restart still re-baselines in-memory to whatever keys exist at that moment,
+so a key that landed in the narrow window between the restart and its next
+poll could be silently absorbed into the new baseline instead of firing an
+event. Bronze ingestion is unaffected either way in the common case
 (idempotent `replaceWhere` per extract-date partition — see
 `dags/ingest_orders_bronze.py`), and a missed trigger is still recoverable by
 a manual `airflow dags trigger`.
@@ -32,6 +36,7 @@ from typing import Any
 
 from airflow.triggers.base import BaseEventTrigger, TriggerEvent
 
+from infrastructure.s3_key_persister import persist_s3_keys_snapshot
 from infrastructure.s3_object_lister import list_keys
 
 DEFAULT_POKE_INTERVAL_SECONDS = 30.0
@@ -72,11 +77,14 @@ class S3NewObjectTrigger(BaseEventTrigger):
         via `asyncio.to_thread` rather than blocking the triggerer's event loop,
         which serves many other triggers concurrently.
         """
-        seen = set(await asyncio.to_thread(list_keys, self.bucket, self.prefix))
+        seen: set[str] = set(await asyncio.to_thread(list_keys, self.bucket, self.prefix))
         while True:
             await asyncio.sleep(self.poke_interval)
-            current = set(await asyncio.to_thread(list_keys, self.bucket, self.prefix))
-            new_keys = sorted(current - seen)
+            seen, new_keys = await asyncio.to_thread(
+                persist_s3_keys_snapshot,
+                self.bucket,
+                self.prefix,
+                seen,
+            )
             for key in new_keys:
                 yield TriggerEvent({"bucket": self.bucket, "key": key})
-            seen |= current
