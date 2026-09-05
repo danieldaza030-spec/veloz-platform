@@ -40,10 +40,15 @@ re-trigger, or the next window's own trigger) safe by construction, which is
 what G3 ("resilient... without someone manually intervening") actually
 requires from an event-driven loader, not just a green task the first time.
 
-The extract date ingested is read off the triggering Asset event's key
-(`date=<date>/` in the new object's path) rather than the run's logical
-date, since an Asset-scheduled run has no `data_interval`/`ds` of its own.
-Manual triggers fall back to the `date` param, then today's UTC date.
+The extract date(s) ingested are read off the triggering Asset event(s)'
+keys (`date=<date>/` in the new object's path) rather than the run's
+logical date, since an Asset-scheduled run has no `data_interval`/`ds` of
+its own. With `max_active_runs=1`, a run still in progress makes Airflow
+coalesce every Asset event that arrives meanwhile onto the next run, so a
+single run can carry keys spanning more than one `date=` partition (e.g.
+across midnight); every distinct date found is ingested, not just the
+first. Manual triggers fall back to the `date` param, then today's UTC
+date.
 """
 
 from __future__ import annotations
@@ -66,7 +71,7 @@ DATE_PARTITION_PATTERN = re.compile(r"date=(\d{4}-\d{2}-\d{2})")
 # plugins/spark_session.py's env-var defaults) so this job's cluster
 # footprint is visible and tunable at the call site.
 SPARK_WORKER_COUNT = 2
-SPARK_CORES_MAX = 10  # None = derive from SPARK_WORKER_COUNT * per-worker cores (see plugins/spark_session.py)
+SPARK_CORES_MAX = 4  # None = derive from SPARK_WORKER_COUNT * per-worker cores (see plugins/spark_session.py)
 
 ORDERS_RAW_ASSET = Asset(
     f"s3://{Buckets.RAW_INCOMING_DATA}/{ORDERS_RAW_PREFIX}/",
@@ -79,23 +84,30 @@ ORDERS_RAW_ASSET = Asset(
 )
 
 
-def _extract_date_from_triggering_event(context: dict) -> str | None:
-    """Pulls the `date=<date>` segment out of the Asset event that triggered this run.
+def _extract_dates_from_triggering_event(context: dict) -> list[str]:
+    """Pulls every distinct `date=<date>` segment out of the Asset events that triggered this run.
 
     `context["triggering_asset_events"]` maps each `Asset` to the list of
     `AssetEvent`s that caused this run; `S3NewObjectTrigger` sets each
     event's `extra` to `{"bucket": ..., "key": ...}` (see that module's
-    `TriggerEvent` payload), so the new object's key is read back off of it
-    here. Returns None for manually triggered runs, which have no
-    triggering asset event.
+    `TriggerEvent` payload), so each new object's key is read back off of
+    it here. Plural because `max_active_runs=1` means a run still in
+    progress makes Airflow coalesce every Asset event that arrives
+    meanwhile onto the next run: if those coalesced events span more than
+    one `date=` partition (e.g. some land just before midnight, some just
+    after), a single run can be responsible for ingesting more than one
+    date, and dropping all but the first would silently leave that other
+    partition un-ingested. Returns an empty list for manually triggered
+    runs, which have no triggering asset event.
     """
     triggering_events = context.get("triggering_asset_events") or {}
+    dates: set[str] = set()
     for events in triggering_events.values():
         for event in events:
             match = DATE_PARTITION_PATTERN.search((event.extra or {}).get("key", ""))
             if match:
-                return match.group(1)
-    return None
+                dates.add(match.group(1))
+    return sorted(dates)
 
 
 @dag(
@@ -134,13 +146,10 @@ def ingest_orders_bronze():
 
         context = get_current_context()
         params = context["params"]
-        target_date = (
-            _extract_date_from_triggering_event(context)
-            or params["date"]
-            or pendulum.now("UTC").to_date_string()
-        )
+        target_dates = _extract_dates_from_triggering_event(context) or [
+            params["date"] or pendulum.now("UTC").to_date_string()
+        ]
 
-        raw_path = f"s3a://{Buckets.RAW_INCOMING_DATA}/{ORDERS_RAW_PREFIX}/date={target_date}/*.csv"
         bronze_path = f"s3a://{Buckets.BRONZE}/{ORDERS_BRONZE_PREFIX}/"
 
         spark = StandaloneSparkSessionFactory(
@@ -151,27 +160,29 @@ def ingest_orders_bronze():
         ).get_session()
 
         try:
-            request = BronzeIngestionRequest(
-                raw_path=raw_path,
-                raw_format="csv",
-                schema=OrdersSchema.RAW,
-                read_options={
-                    "header": "true",
-                    # FAILFAST: fail loudly on any row that doesn't match
-                    # OrdersSchema.RAW instead of coercing it.
-                    "mode": "FAILFAST",
-                },
-                bronze_path=bronze_path,
-                partition_column=EXTRACT_DATE_COLUMN,
-                extract_date=target_date,
-            )
+            for target_date in target_dates:
+                raw_path = f"s3a://{Buckets.RAW_INCOMING_DATA}/{ORDERS_RAW_PREFIX}/date={target_date}/*.csv"
+                request = BronzeIngestionRequest(
+                    raw_path=raw_path,
+                    raw_format="csv",
+                    schema=OrdersSchema.RAW,
+                    read_options={
+                        "header": "true",
+                        # FAILFAST: fail loudly on any row that doesn't match
+                        # OrdersSchema.RAW instead of coercing it.
+                        "mode": "FAILFAST",
+                    },
+                    bronze_path=bronze_path,
+                    partition_column=EXTRACT_DATE_COLUMN,
+                    extract_date=target_date,
+                )
 
-            print(f"reading raw orders extract: {raw_path}")
-            row_count = ingest_to_bronze(spark, request)
-            print(
-                f"wrote {row_count} rows to {bronze_path} "
-                f"(partition {EXTRACT_DATE_COLUMN}={target_date})"
-            )
+                print(f"reading raw orders extract: {raw_path}")
+                row_count = ingest_to_bronze(spark, request)
+                print(
+                    f"wrote {row_count} rows to {bronze_path} "
+                    f"(partition {EXTRACT_DATE_COLUMN}={target_date})"
+                )
         finally:
             spark.stop()
 

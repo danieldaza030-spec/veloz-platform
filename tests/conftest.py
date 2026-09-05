@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import sys
 import tempfile
 import types
@@ -72,6 +73,61 @@ def _install_airflow_triggers_base_stub() -> None:
 
 
 _install_airflow_triggers_base_stub()
+
+
+def _exec_dag_pure_symbols(dag_path: Path, names: set[str], namespace: dict) -> dict:
+    """Execs selected top-level symbols out of a DAG module's source, without importing it.
+
+    DAG modules under `dags/` import `airflow.sdk`, which requires a real
+    Airflow install this test environment does not have (see
+    `_install_airflow_triggers_base_stub` above for the same problem one
+    level down, at `airflow.triggers.base`). Rather than stubbing the much
+    larger `airflow.sdk` surface, pure, Airflow-independent top-level
+    constants/functions defined in a DAG module (no dependency on Airflow,
+    Spark, or any DAG-scoped object) are unit-tested by parsing the
+    module's source with `ast` and exec'ing only the requested top-level
+    `Assign`/`FunctionDef` nodes into an isolated namespace, leaving every
+    Airflow-dependent line of the module untouched and unimported.
+
+    Args:
+        dag_path: Path to the DAG module's source file.
+        names: Names of the top-level assignment targets or function
+            definitions to pull out of the module.
+        namespace: Namespace to exec the selected nodes into; also supplies
+            any names those nodes need at exec time (e.g. `re`).
+
+    Returns:
+        `namespace`, mutated in place with the requested names now bound.
+    """
+    tree = ast.parse(dag_path.read_text())
+    wanted = [
+        node
+        for node in tree.body
+        if (isinstance(node, ast.FunctionDef) and node.name in names)
+        or (
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id in names for target in node.targets)
+        )
+    ]
+    module = ast.Module(body=wanted, type_ignores=[])
+    exec(compile(module, filename=str(dag_path), mode="exec"), namespace)  # noqa: S102
+    return namespace
+
+
+@pytest.fixture
+def load_dag_pure_symbols():
+    """Returns a loader for pure, Airflow-independent symbols defined in a `dags/*.py` module.
+
+    See `_exec_dag_pure_symbols` for why this avoids importing the DAG
+    module directly.
+    """
+
+    def _load(dag_filename: str, names: set[str], extra_globals: dict | None = None) -> dict:
+        dag_path = Path(__file__).parent.parent / "dags" / dag_filename
+        namespace = dict(extra_globals or {})
+        return _exec_dag_pure_symbols(dag_path, names, namespace)
+
+    return _load
 
 
 @pytest.fixture
