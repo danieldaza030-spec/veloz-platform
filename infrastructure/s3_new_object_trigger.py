@@ -13,17 +13,23 @@ trigger instead fires exactly once per newly observed key: it baselines the
 keys already present under the prefix at startup, then poll-diffs against that
 in-memory set, so each key can only ever cause one Asset update.
 
-Trade-off accepted deliberately for this scope (G5, one-person team, no extra
-infra): the "already seen" set lives primarily in the triggerer process's
-memory, not in Airflow's metadata DB. Each poll persists that set — and any
-newly observed keys — to object storage via `persist_s3_keys_snapshot`
-(manifest + per-poll diff, best-effort, never raises), so a human or a future
-recovery job can reconstruct what the trigger saw and when. A triggerer
-restart still re-baselines in-memory to whatever keys exist at that moment,
-so a key that landed in the narrow window between the restart and its next
-poll could be silently absorbed into the new baseline instead of firing an
-event. Bronze ingestion is unaffected either way in the common case
-(idempotent `replaceWhere` per extract-date partition — see
+The "already seen" set is manifest-seeded, not baselined blind: `run()` reads
+the existing manifest via `read_manifest_seen_keys` before entering the poll
+loop, so a triggerer restart resumes from what a prior run already recorded
+instead of silently absorbing whatever keys exist at that moment into a fresh
+baseline. Only when no valid manifest exists (first run, or the manifest is
+missing/corrupt/malformed) does the trigger fall back to firing one event per
+currently-listed key, on the reasoning that a duplicate event is cheap and a
+missed one is not. Each poll persists the set — and any newly observed keys —
+to object storage via `persist_seen_keys` (manifest + per-poll diff,
+best-effort, never raises) *after* yielding events for that poll's new keys,
+so a crash between listing and persisting can at worst cause a key to be
+refired on the next restart, never dropped. The residual gap is that listing,
+yielding, and persisting are not one atomic operation: a crash after events
+are yielded but before the manifest write lands means the manifest doesn't
+yet reflect those keys, so the next restart's manifest read is missing them
+and will refire them once more. Bronze ingestion is unaffected either way in
+the common case (idempotent `replaceWhere` per extract-date partition — see
 `dags/ingest_orders_bronze.py`), and a missed trigger is still recoverable by
 a manual `airflow dags trigger`.
 """
@@ -36,7 +42,12 @@ from typing import Any
 
 from airflow.triggers.base import BaseEventTrigger, TriggerEvent
 
-from infrastructure.s3_key_persister import persist_s3_keys_snapshot
+from infrastructure.s3_key_persister import (
+    compute_seen_diff,
+    persist_seen_keys,
+    read_manifest_seen_keys,
+    validate_watch_prefix,
+)
 from infrastructure.s3_object_lister import list_keys
 
 DEFAULT_POKE_INTERVAL_SECONDS = 30.0
@@ -47,8 +58,19 @@ class S3NewObjectTrigger(BaseEventTrigger):
 
     Args:
         bucket: S3/MinIO bucket to watch, e.g. `Buckets.RAW_INCOMING_DATA`.
-        prefix: Key prefix to watch, e.g. `"orders/"`.
+        prefix: Key prefix to watch, e.g. `"orders/"`. Must be non-empty
+            and must not overlap `s3_key_persister`'s own metadata tree
+            (`META_PREFIX_ROOT`).
         poke_interval: Seconds between listings.
+
+    Raises:
+        ValueError: If `prefix` is empty, or overlaps
+            `s3_key_persister`'s metadata tree (see
+            `validate_watch_prefix`). This trigger writes its manifest
+            into the same bucket it watches, so a prefix covering (or
+            covered by) that tree would make the trigger observe its
+            own manifest/diff writes as new keys — a self-reinforcing
+            loop.
     """
 
     def __init__(
@@ -59,6 +81,7 @@ class S3NewObjectTrigger(BaseEventTrigger):
         poke_interval: float = DEFAULT_POKE_INTERVAL_SECONDS,
     ) -> None:
         super().__init__()
+        validate_watch_prefix(prefix)
         self.bucket = bucket
         self.prefix = prefix
         self.poke_interval = poke_interval
@@ -71,20 +94,40 @@ class S3NewObjectTrigger(BaseEventTrigger):
         )
 
     async def run(self) -> AsyncIterator[TriggerEvent]:
-        """Polls the prefix forever, yielding one event per newly observed key.
+        """Seeds from the manifest, then polls forever, yielding events before persisting.
 
-        `list_keys` is plain boto3 (synchronous), so it runs in a worker thread
-        via `asyncio.to_thread` rather than blocking the triggerer's event loop,
-        which serves many other triggers concurrently.
+        `list_keys`/`compute_seen_diff`/`persist_seen_keys` are plain boto3
+        (synchronous), so each runs in a worker thread via `asyncio.to_thread`
+        rather than blocking the triggerer's event loop, which serves many
+        other triggers concurrently.
+
+        Seeding tries `read_manifest_seen_keys` first so a restart resumes
+        from what a prior run already recorded. If no valid manifest exists
+        (first run, or it's missing/corrupt/malformed), every currently-listed
+        key is treated as new and fired once, since a duplicate event is cheap
+        and a missed one is not.
+
+        Each poll computes the diff and yields events for it *before*
+        persisting the updated manifest, so a persistence failure can't mark
+        a key durably seen that never actually fired.
         """
-        seen: set[str] = set(await asyncio.to_thread(list_keys, self.bucket, self.prefix))
+        seen = await asyncio.to_thread(read_manifest_seen_keys, self.bucket, self.prefix)
+        if seen is None:
+            current = await asyncio.to_thread(list_keys, self.bucket, self.prefix)
+            seen = set(current)
+            new_keys = sorted(current)
+            for key in new_keys:
+                yield TriggerEvent({"bucket": self.bucket, "key": key})
+            await asyncio.to_thread(persist_seen_keys, self.bucket, self.prefix, seen, new_keys)
+
         while True:
             await asyncio.sleep(self.poke_interval)
             seen, new_keys = await asyncio.to_thread(
-                persist_s3_keys_snapshot,
+                compute_seen_diff,
                 self.bucket,
                 self.prefix,
                 seen,
             )
             for key in new_keys:
                 yield TriggerEvent({"bucket": self.bucket, "key": key})
+            await asyncio.to_thread(persist_seen_keys, self.bucket, self.prefix, seen, new_keys)

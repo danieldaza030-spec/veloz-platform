@@ -1,15 +1,31 @@
-"""Tests for infrastructure/s3_key_persister.py and infrastructure/s3_metadata_writer.py."""
+"""Tests for infrastructure/s3_key_persister.py."""
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 from unittest.mock import MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError
 
-from infrastructure.s3_key_persister import persist_s3_keys_snapshot
-from infrastructure.s3_metadata_writer import write_json
+from infrastructure.s3_key_persister import (
+    compute_seen_diff,
+    manifest_key,
+    persist_s3_keys_snapshot,
+    read_manifest_seen_keys,
+    validate_watch_prefix,
+    write_json,
+)
+
+
+def _client_error(operation_name: str = "GetObject") -> ClientError:
+    """Builds a `ClientError` shaped like a MinIO/S3 "no such key" response."""
+    return ClientError(
+        {"Error": {"Code": "NoSuchKey", "Message": "The specified key does not exist."}},
+        operation_name,
+    )
 
 
 class TestWriteJson:
@@ -20,7 +36,7 @@ class TestWriteJson:
         mock_client = MagicMock()
 
         with patch.dict(os.environ, {"MINIO_ENDPOINT": "http://localhost:9000"}):
-            with patch("infrastructure.s3_metadata_writer.boto3.client") as mock_boto3_client:
+            with patch("infrastructure.s3_key_persister.boto3.client") as mock_boto3_client:
                 mock_boto3_client.return_value = mock_client
 
                 write_json("test-bucket", "test-key", {"data": "value"})
@@ -43,7 +59,7 @@ class TestWriteJson:
         payload = {"key": "value", "nested": {"x": 1}}
 
         with patch.dict(os.environ, {"MINIO_ENDPOINT": "http://localhost:9000"}):
-            with patch("infrastructure.s3_metadata_writer.boto3.client") as mock_boto3_client:
+            with patch("infrastructure.s3_key_persister.boto3.client") as mock_boto3_client:
                 mock_boto3_client.return_value = mock_client
 
                 write_json("test-bucket", "test-key", payload)
@@ -62,7 +78,7 @@ class TestWriteJson:
         mock_client = MagicMock()
 
         with patch.dict(os.environ, {"MINIO_ENDPOINT": "http://localhost:9000"}):
-            with patch("infrastructure.s3_metadata_writer.boto3.client") as mock_boto3_client:
+            with patch("infrastructure.s3_key_persister.boto3.client") as mock_boto3_client:
                 mock_boto3_client.return_value = mock_client
 
                 write_json("my-bucket", "my-key", {"test": "data"})
@@ -73,12 +89,12 @@ class TestWriteJson:
                 assert call_args.kwargs["Key"] == "my-key"
 
     def test_write_json_no_airflow_imports(self) -> None:
-        """Verify write_json module does not import Airflow."""
+        """Verify s3_key_persister does not import Airflow."""
         import inspect
 
-        import infrastructure.s3_metadata_writer as metadata_writer
+        import infrastructure.s3_key_persister as key_persister
 
-        module_source = inspect.getsource(metadata_writer)
+        module_source = inspect.getsource(key_persister)
         assert "from airflow" not in module_source
         assert "import airflow" not in module_source
 
@@ -306,3 +322,173 @@ class TestPersistS3KeysSnapshot:
         # Should include the timestamp pattern (YYYYMMDDTHHMMSSZ)
         assert "_meta/s3_key_persister/my-bucket/my-prefix/diffs/" in diff_key
         assert diff_key.endswith(".json")
+
+
+class TestManifestKeyPrefixNormalization:
+    """Regression tests for manifest_key's handling of bare (no trailing slash) prefixes."""
+
+    def test_manifest_key_normalizes_prefix_without_trailing_slash(self) -> None:
+        """A prefix with no trailing slash must not run into the filename.
+
+        Before the fix, `manifest_key("bucket", "orders")` produced
+        `"_meta/s3_key_persister/bucket/ordersmanifest.json"` — the prefix's
+        last path segment ran together with the filename instead of the two
+        being separated by a slash.
+        """
+        assert (
+            manifest_key("bucket", "orders")
+            == "_meta/s3_key_persister/bucket/orders/manifest.json"
+        )
+
+    def test_manifest_key_leaves_trailing_slash_prefix_unchanged(self) -> None:
+        """A prefix that already ends with a slash is not double-slashed."""
+        assert (
+            manifest_key("bucket", "orders/")
+            == "_meta/s3_key_persister/bucket/orders/manifest.json"
+        )
+
+
+class TestReadManifestSeenKeys:
+    """Tests for read_manifest_seen_keys's missing/corrupt/bad-schema handling.
+
+    These return-value/log distinctions are what let `S3NewObjectTrigger`
+    seed from a valid manifest without refiring, while falling back to
+    firing every currently-listed key whenever the manifest can't be
+    trusted (missing, corrupt, or malformed) — a duplicate event is cheap,
+    a missed one is not.
+    """
+
+    def test_valid_manifest_seeds_seen_without_refiring(self) -> None:
+        """A present, well-formed manifest returns exactly its recorded keys."""
+        mock_read_json = MagicMock(
+            return_value={"seen_keys": ["a.txt", "b.txt"], "updated_at": "2026-01-01T00:00:00Z"}
+        )
+
+        with patch("infrastructure.s3_key_persister.read_json", mock_read_json):
+            result = read_manifest_seen_keys("bucket", "prefix/")
+
+        assert result == {"a.txt", "b.txt"}
+
+        # Feeding that seed into a diff against a matching current listing
+        # produces no new keys: the manifest-present path seeds without
+        # refiring, unlike the manifest-absent path below.
+        mock_list_keys = MagicMock(return_value=["a.txt", "b.txt"])
+        with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
+            _, new_keys = compute_seen_diff("bucket", "prefix/", result)
+        assert new_keys == []
+
+    def test_missing_manifest_returns_none_and_fires_all(self) -> None:
+        """A missing manifest (first run) returns None so callers fire every key."""
+        mock_read_json = MagicMock(side_effect=_client_error())
+
+        with patch("infrastructure.s3_key_persister.read_json", mock_read_json):
+            result = read_manifest_seen_keys("bucket", "prefix/")
+
+        assert result is None
+
+        # Fire-all semantics: seeded with an empty set, every current key is "new".
+        mock_list_keys = MagicMock(return_value=["a.txt", "b.txt"])
+        with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
+            _, new_keys = compute_seen_diff("bucket", "prefix/", set())
+        assert new_keys == ["a.txt", "b.txt"]
+
+    def test_corrupt_json_returns_none_and_fires_all_with_distinct_log_from_missing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Corrupt JSON also returns None (fire-all), but logs distinctly from a missing manifest."""
+        mock_read_json_corrupt = MagicMock(
+            side_effect=json.JSONDecodeError("Expecting value", "not json", 0)
+        )
+        with caplog.at_level(logging.INFO, logger="infrastructure.s3_key_persister"):
+            with patch("infrastructure.s3_key_persister.read_json", mock_read_json_corrupt):
+                result = read_manifest_seen_keys("bucket", "prefix/")
+            corrupt_log = caplog.text
+
+            caplog.clear()
+            mock_read_json_missing = MagicMock(side_effect=_client_error())
+            with patch("infrastructure.s3_key_persister.read_json", mock_read_json_missing):
+                read_manifest_seen_keys("bucket", "prefix/")
+            missing_log = caplog.text
+
+        assert result is None
+        assert corrupt_log != missing_log
+        assert "not valid JSON" in corrupt_log
+        assert "not valid JSON" not in missing_log
+
+    def test_bad_schema_returns_none_and_fires_all_with_distinct_log_from_corrupt(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A structurally-wrong manifest also returns None, but logs distinctly from corrupt JSON."""
+        mock_read_json_bad_schema = MagicMock(return_value={"seen_keys": "not-a-list"})
+        with caplog.at_level(logging.WARNING, logger="infrastructure.s3_key_persister"):
+            with patch("infrastructure.s3_key_persister.read_json", mock_read_json_bad_schema):
+                result = read_manifest_seen_keys("bucket", "prefix/")
+            bad_schema_log = caplog.text
+
+            caplog.clear()
+            mock_read_json_corrupt = MagicMock(
+                side_effect=json.JSONDecodeError("Expecting value", "not json", 0)
+            )
+            with patch("infrastructure.s3_key_persister.read_json", mock_read_json_corrupt):
+                read_manifest_seen_keys("bucket", "prefix/")
+            corrupt_log = caplog.text
+
+        assert result is None
+        assert bad_schema_log != corrupt_log
+        assert "invalid or missing 'seen_keys'" in bad_schema_log
+        assert "invalid or missing 'seen_keys'" not in corrupt_log
+
+
+class TestManifestReadMergeWrite:
+    """Tests that persisting a manifest merges rather than truncates history."""
+
+    def test_manifest_write_unions_old_manifest_seen_and_current(self) -> None:
+        """The written manifest must union old-manifest-only, previously-seen,
+        and newly-listed keys — not truncate to whichever set was freshest.
+        """
+        mock_list_keys = MagicMock(return_value=["current.txt"])
+        mock_read_json = MagicMock(
+            return_value={"seen_keys": ["old_manifest_only.txt"], "updated_at": "2026-01-01T00:00:00Z"}
+        )
+        payloads_written = []
+
+        def capture_write_json(bucket, key, payload):
+            payloads_written.append((key, payload))
+
+        mock_write_json = MagicMock(side_effect=capture_write_json)
+        seen = {"previously_seen.txt"}
+
+        with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
+            with patch("infrastructure.s3_key_persister.read_json", mock_read_json):
+                with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
+                    persist_s3_keys_snapshot("bucket", "prefix/", seen)
+
+        manifest_payload = next(payload for key, payload in payloads_written if "manifest" in key)
+        assert set(manifest_payload["seen_keys"]) == {
+            "old_manifest_only.txt",
+            "previously_seen.txt",
+            "current.txt",
+        }
+
+
+class TestValidateWatchPrefix:
+    """Tests for the prefix guard `S3NewObjectTrigger` relies on to avoid self-observation."""
+
+    def test_raises_value_error_for_empty_prefix(self) -> None:
+        """An empty prefix (watching the whole bucket) must be rejected."""
+        with pytest.raises(ValueError):
+            validate_watch_prefix("")
+
+    def test_raises_value_error_for_prefix_inside_metadata_tree(self) -> None:
+        """A prefix nested inside the metadata tree would watch the trigger's own writes."""
+        with pytest.raises(ValueError):
+            validate_watch_prefix("_meta/s3_key_persister/raw-incoming-data/orders/")
+
+    def test_raises_value_error_for_prefix_that_is_ancestor_of_metadata_tree(self) -> None:
+        """A prefix that is itself an ancestor of the metadata tree has the same problem."""
+        with pytest.raises(ValueError):
+            validate_watch_prefix("_meta/")
+
+    def test_does_not_raise_for_unrelated_prefix(self) -> None:
+        """A normal, unrelated prefix passes the guard without raising."""
+        validate_watch_prefix("orders/")
