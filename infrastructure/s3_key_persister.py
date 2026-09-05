@@ -69,10 +69,18 @@ def validate_watch_prefix(prefix: str) -> None:
             metadata tree, or a prefix that is itself an ancestor of
             it). Either case would make a watcher observe its own
             manifest/diff writes as new keys — a self-reinforcing loop.
+            The overlap check is path-segment aware (both sides are
+            trailing-slash normalized before comparing), so a prefix
+            that merely shares a string prefix with `META_PREFIX_ROOT`
+            without matching a full path segment — e.g. `"_met"` against
+            `"_meta/..."` — is not falsely rejected as an ancestor.
     """
     if not prefix:
         raise ValueError("prefix must be non-empty.")
-    if prefix.startswith(META_PREFIX_ROOT) or META_PREFIX_ROOT.startswith(prefix):
+    normalized_prefix = _normalize_prefix(prefix)
+    if normalized_prefix.startswith(META_PREFIX_ROOT) or META_PREFIX_ROOT.startswith(
+        normalized_prefix
+    ):
         raise ValueError(
             f"prefix {prefix!r} overlaps the s3_key_persister metadata tree "
             f"({META_PREFIX_ROOT!r}); a watcher on it would observe its own "
@@ -273,11 +281,12 @@ def compute_seen_diff(
     """Diffs the current keys under a prefix against a seen-keys set.
 
     Pure computation beyond the listing call itself: does not touch the
-    manifest or diff files in object storage. Split out from
-    `persist_s3_keys_snapshot` so a caller that must act on new keys
-    before they're durably recorded — `S3NewObjectTrigger`, which has to
-    yield `TriggerEvent`s before persisting so a persistence failure
-    can't mark a key durably seen that never fired — can do so.
+    manifest or diff files in object storage, so a caller that must act
+    on new keys before they're durably recorded — `S3NewObjectTrigger`,
+    which has to yield `TriggerEvent`s before persisting so a
+    persistence failure can't mark a key durably seen that never fired —
+    can call this and `persist_seen_keys` separately with its own logic
+    in between.
 
     Args:
         bucket: S3/MinIO bucket to list, e.g. `Buckets.RAW_INCOMING_DATA`.
@@ -357,33 +366,3 @@ def persist_seen_keys(
                 bucket,
                 prefix,
             )
-
-
-def persist_s3_keys_snapshot(
-    bucket: str,
-    prefix: str,
-    seen: set[str],
-) -> tuple[set[str], list[str]]:
-    """Diffs the current keys under a prefix against a seen-keys set and persists both.
-
-    Thin orchestration over `compute_seen_diff` (the non-writing diff)
-    and `persist_seen_keys` (the best-effort manifest/diff write).
-    Callers that need to act on `new_keys` before they're durably
-    recorded should call those two functions directly instead, with
-    their own logic in between.
-
-    Args:
-        bucket: S3/MinIO bucket to list, e.g. `Buckets.RAW_INCOMING_DATA`.
-        prefix: Key prefix to list, e.g. `"orders/"`.
-        seen: Keys already observed on a prior call. Mutated in place
-            (via `|=`) to include the newly observed keys, then returned.
-
-    Returns:
-        A tuple of `(seen, new_keys)`: `seen` is the same set object
-        passed in, updated to include every currently-listed key;
-        `new_keys` is the sorted list of keys present now but absent
-        from `seen` before this call.
-    """
-    seen, new_keys = compute_seen_diff(bucket, prefix, seen)
-    persist_seen_keys(bucket, prefix, seen, new_keys)
-    return seen, new_keys

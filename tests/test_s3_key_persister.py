@@ -13,7 +13,7 @@ from botocore.exceptions import ClientError
 from infrastructure.s3_key_persister import (
     compute_seen_diff,
     manifest_key,
-    persist_s3_keys_snapshot,
+    persist_seen_keys,
     read_manifest_seen_keys,
     validate_watch_prefix,
     write_json,
@@ -99,43 +99,39 @@ class TestWriteJson:
         assert "import airflow" not in module_source
 
 
-class TestPersistS3KeysSnapshot:
-    """Test S3/MinIO key snapshot persistence with diff logic."""
+class TestComputeSeenDiff:
+    """Test the pure current-vs-seen diff computation."""
 
-    def test_persist_new_keys_equals_sorted_current_minus_seen(self) -> None:
+    def test_new_keys_equals_sorted_current_minus_seen(self) -> None:
         """Verify new_keys == sorted(current - seen)."""
         mock_list_keys = MagicMock(return_value=["c.txt", "a.txt", "b.txt"])
-        mock_write_json = MagicMock()
         seen = {"a.txt"}
 
         with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
-            with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
-                result_seen, new_keys = persist_s3_keys_snapshot(
-                    "test-bucket", "test-prefix/", seen
-                )
+            _, new_keys = compute_seen_diff("test-bucket", "test-prefix/", seen)
 
-                # new_keys should be sorted difference
-                assert new_keys == ["b.txt", "c.txt"]
+            # new_keys should be sorted difference
+            assert new_keys == ["b.txt", "c.txt"]
 
-    def test_persist_returned_seen_is_mutated_original_object(self) -> None:
+    def test_returned_seen_is_mutated_original_object(self) -> None:
         """Verify returned seen is the same object (mutated), not a fresh set."""
         mock_list_keys = MagicMock(return_value=["new_key.txt"])
-        mock_write_json = MagicMock()
         original_seen = {"old_key.txt"}
         seen_id = id(original_seen)
 
         with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
-            with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
-                result_seen, _ = persist_s3_keys_snapshot(
-                    "test-bucket", "test-prefix/", original_seen
-                )
+            result_seen, _ = compute_seen_diff("test-bucket", "test-prefix/", original_seen)
 
-                # Verify it's the same object
-                assert id(result_seen) == seen_id
-                # Verify it was mutated to include the new key
-                assert result_seen == {"old_key.txt", "new_key.txt"}
+            # Verify it's the same object
+            assert id(result_seen) == seen_id
+            # Verify it was mutated to include the new key
+            assert result_seen == {"old_key.txt", "new_key.txt"}
 
-    def test_persist_manifest_write_always_attempted(self) -> None:
+
+class TestPersistSeenKeys:
+    """Test S3/MinIO manifest/diff persistence given an already-computed diff."""
+
+    def test_manifest_write_always_attempted(self) -> None:
         """Verify manifest write is attempted every call, even with no new keys."""
         mock_list_keys = MagicMock(return_value=["existing.txt"])
         mock_write_json = MagicMock()
@@ -143,7 +139,8 @@ class TestPersistS3KeysSnapshot:
 
         with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
             with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
-                persist_s3_keys_snapshot("test-bucket", "test-prefix/", seen)
+                seen, new_keys = compute_seen_diff("test-bucket", "test-prefix/", seen)
+                persist_seen_keys("test-bucket", "test-prefix/", seen, new_keys)
 
                 # Verify write_json was called at least once (for manifest)
                 assert mock_write_json.call_count >= 1
@@ -151,7 +148,7 @@ class TestPersistS3KeysSnapshot:
                 first_call_args = mock_write_json.call_args_list[0]
                 assert "manifest.json" in first_call_args.args[1]
 
-    def test_persist_diff_write_only_when_new_keys_nonempty(self) -> None:
+    def test_diff_write_only_when_new_keys_nonempty(self) -> None:
         """Verify diff write is attempted only when new_keys is non-empty."""
         mock_list_keys = MagicMock(return_value=["existing.txt"])
         mock_write_json = MagicMock()
@@ -159,7 +156,8 @@ class TestPersistS3KeysSnapshot:
 
         with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
             with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
-                persist_s3_keys_snapshot("test-bucket", "test-prefix/", seen)
+                seen, new_keys = compute_seen_diff("test-bucket", "test-prefix/", seen)
+                persist_seen_keys("test-bucket", "test-prefix/", seen, new_keys)
 
                 # Only manifest should be written (no diff when no new keys)
                 assert mock_write_json.call_count == 1
@@ -171,12 +169,13 @@ class TestPersistS3KeysSnapshot:
 
         with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
             with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
-                persist_s3_keys_snapshot("test-bucket", "test-prefix/", seen)
+                seen, new_keys = compute_seen_diff("test-bucket", "test-prefix/", seen)
+                persist_seen_keys("test-bucket", "test-prefix/", seen, new_keys)
 
                 # Both manifest and diff should be written
                 assert mock_write_json.call_count == 2
 
-    def test_persist_manifest_failure_does_not_prevent_diff_attempt(self) -> None:
+    def test_manifest_failure_does_not_prevent_diff_attempt(self) -> None:
         """Verify manifest write failure doesn't prevent diff write, and no exception raised."""
         mock_list_keys = MagicMock(return_value=["new.txt"])
         call_count = {"count": 0}
@@ -191,17 +190,16 @@ class TestPersistS3KeysSnapshot:
 
         with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
             with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
+                seen, new_keys = compute_seen_diff("test-bucket", "test-prefix/", seen)
                 # Should not raise
-                result_seen, new_keys = persist_s3_keys_snapshot(
-                    "test-bucket", "test-prefix/", seen
-                )
+                persist_seen_keys("test-bucket", "test-prefix/", seen, new_keys)
 
                 # Both write attempts should have been made
                 assert mock_write_json.call_count == 2
                 assert new_keys == ["new.txt"]
-                assert "new.txt" in result_seen
+                assert "new.txt" in seen
 
-    def test_persist_diff_failure_does_not_prevent_manifest_attempt(self) -> None:
+    def test_diff_failure_does_not_prevent_manifest_attempt(self) -> None:
         """Verify diff write failure doesn't prevent manifest write, and no exception raised."""
         mock_list_keys = MagicMock(return_value=["new.txt"])
         call_count = {"count": 0}
@@ -216,17 +214,16 @@ class TestPersistS3KeysSnapshot:
 
         with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
             with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
+                seen, new_keys = compute_seen_diff("test-bucket", "test-prefix/", seen)
                 # Should not raise
-                result_seen, new_keys = persist_s3_keys_snapshot(
-                    "test-bucket", "test-prefix/", seen
-                )
+                persist_seen_keys("test-bucket", "test-prefix/", seen, new_keys)
 
                 # Both write attempts should have been made
                 assert mock_write_json.call_count == 2
                 assert new_keys == ["new.txt"]
-                assert "new.txt" in result_seen
+                assert "new.txt" in seen
 
-    def test_persist_both_writes_can_fail_independently(self) -> None:
+    def test_both_writes_can_fail_independently(self) -> None:
         """Verify manifest and diff failures don't cause the function to raise."""
         mock_list_keys = MagicMock(return_value=["new.txt"])
         mock_write_json = MagicMock(side_effect=RuntimeError("Write failed"))
@@ -234,15 +231,14 @@ class TestPersistS3KeysSnapshot:
 
         with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
             with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
+                seen, new_keys = compute_seen_diff("test-bucket", "test-prefix/", seen)
                 # Should not raise even though both writes fail
-                result_seen, new_keys = persist_s3_keys_snapshot(
-                    "test-bucket", "test-prefix/", seen
-                )
+                persist_seen_keys("test-bucket", "test-prefix/", seen, new_keys)
 
                 assert new_keys == ["new.txt"]
-                assert "new.txt" in result_seen
+                assert "new.txt" in seen
 
-    def test_persist_manifest_payload_includes_all_seen_keys_sorted(self) -> None:
+    def test_manifest_payload_includes_all_seen_keys_sorted(self) -> None:
         """Verify manifest payload includes sorted list of all seen keys."""
         mock_list_keys = MagicMock(return_value=["z.txt", "a.txt", "m.txt"])
         payloads_written = []
@@ -255,7 +251,8 @@ class TestPersistS3KeysSnapshot:
 
         with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
             with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
-                persist_s3_keys_snapshot("test-bucket", "test-prefix/", seen)
+                seen, new_keys = compute_seen_diff("test-bucket", "test-prefix/", seen)
+                persist_seen_keys("test-bucket", "test-prefix/", seen, new_keys)
 
         manifest_call = [p for p in payloads_written if "manifest" in p[0]][0]
         manifest_payload = manifest_call[1]
@@ -263,7 +260,7 @@ class TestPersistS3KeysSnapshot:
         assert manifest_payload["seen_keys"] == ["a.txt", "m.txt", "z.txt"]
         assert "updated_at" in manifest_payload
 
-    def test_persist_diff_payload_includes_new_keys_and_timestamp(self) -> None:
+    def test_diff_payload_includes_new_keys_and_timestamp(self) -> None:
         """Verify diff payload includes new_keys list and timestamp."""
         mock_list_keys = MagicMock(return_value=["c.txt", "a.txt", "b.txt"])
         payloads_written = []
@@ -276,7 +273,8 @@ class TestPersistS3KeysSnapshot:
 
         with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
             with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
-                persist_s3_keys_snapshot("test-bucket", "test-prefix/", seen)
+                seen, new_keys = compute_seen_diff("test-bucket", "test-prefix/", seen)
+                persist_seen_keys("test-bucket", "test-prefix/", seen, new_keys)
 
         diff_calls = [p for p in payloads_written if "diffs" in p[0]]
         assert len(diff_calls) == 1
@@ -285,7 +283,7 @@ class TestPersistS3KeysSnapshot:
         assert diff_payload["new_keys"] == ["b.txt", "c.txt"]
         assert "polled_at" in diff_payload
 
-    def test_persist_manifest_key_path_includes_bucket_and_prefix(self) -> None:
+    def test_manifest_key_path_includes_bucket_and_prefix(self) -> None:
         """Verify manifest key path is constructed correctly."""
         mock_list_keys = MagicMock(return_value=[])
         keys_written = []
@@ -298,12 +296,13 @@ class TestPersistS3KeysSnapshot:
 
         with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
             with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
-                persist_s3_keys_snapshot("my-bucket", "my-prefix/", seen)
+                seen, new_keys = compute_seen_diff("my-bucket", "my-prefix/", seen)
+                persist_seen_keys("my-bucket", "my-prefix/", seen, new_keys)
 
         manifest_key = keys_written[0]
         assert manifest_key == "_meta/s3_key_persister/my-bucket/my-prefix/manifest.json"
 
-    def test_persist_diff_key_path_includes_timestamp(self) -> None:
+    def test_diff_key_path_includes_timestamp(self) -> None:
         """Verify diff key path includes ISO timestamp."""
         mock_list_keys = MagicMock(return_value=["new.txt"])
         keys_written = []
@@ -316,7 +315,8 @@ class TestPersistS3KeysSnapshot:
 
         with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
             with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
-                persist_s3_keys_snapshot("my-bucket", "my-prefix/", seen)
+                seen, new_keys = compute_seen_diff("my-bucket", "my-prefix/", seen)
+                persist_seen_keys("my-bucket", "my-prefix/", seen, new_keys)
 
         diff_key = keys_written[1]
         # Should include the timestamp pattern (YYYYMMDDTHHMMSSZ)
@@ -461,7 +461,8 @@ class TestManifestReadMergeWrite:
         with patch("infrastructure.s3_key_persister.list_keys", mock_list_keys):
             with patch("infrastructure.s3_key_persister.read_json", mock_read_json):
                 with patch("infrastructure.s3_key_persister.write_json", mock_write_json):
-                    persist_s3_keys_snapshot("bucket", "prefix/", seen)
+                    seen, new_keys = compute_seen_diff("bucket", "prefix/", seen)
+                    persist_seen_keys("bucket", "prefix/", seen, new_keys)
 
         manifest_payload = next(payload for key, payload in payloads_written if "manifest" in key)
         assert set(manifest_payload["seen_keys"]) == {
@@ -492,3 +493,17 @@ class TestValidateWatchPrefix:
     def test_does_not_raise_for_unrelated_prefix(self) -> None:
         """A normal, unrelated prefix passes the guard without raising."""
         validate_watch_prefix("orders/")
+
+    def test_does_not_raise_for_prefix_that_only_shares_a_string_prefix(self) -> None:
+        """A prefix that is a truncated first segment of the tree root must pass.
+
+        `"_met"` is a string-prefix of `META_PREFIX_ROOT` (`"_meta/..."`) but
+        does not match a full path segment, so it is not actually an
+        ancestor directory of the metadata tree and must not be rejected.
+        """
+        validate_watch_prefix("_met")
+
+    def test_raises_value_error_for_bare_first_segment_of_metadata_tree(self) -> None:
+        """A bare (no trailing slash) exact first segment is still an ancestor."""
+        with pytest.raises(ValueError):
+            validate_watch_prefix("_meta")

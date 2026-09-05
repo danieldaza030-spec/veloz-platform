@@ -17,10 +17,13 @@ The "already seen" set is manifest-seeded, not baselined blind: `run()` reads
 the existing manifest via `read_manifest_seen_keys` before entering the poll
 loop, so a triggerer restart resumes from what a prior run already recorded
 instead of silently absorbing whatever keys exist at that moment into a fresh
-baseline. Only when no valid manifest exists (first run, or the manifest is
-missing/corrupt/malformed) does the trigger fall back to firing one event per
-currently-listed key, on the reasoning that a duplicate event is cheap and a
-missed one is not. Each poll persists the set — and any newly observed keys —
+baseline. Only when no valid manifest exists (first run, the manifest is
+missing/corrupt/malformed, or the read itself raises an unexpected error)
+does the trigger fall back to firing one event per currently-listed key, on
+the reasoning that a duplicate event is cheap and a missed one is not — and
+that an unhandled exception from the seed read would yield zero events,
+which is strictly worse. Each poll persists the set — and any newly observed
+keys —
 to object storage via `persist_seen_keys` (manifest + per-poll diff,
 best-effort, never raises) *after* yielding events for that poll's new keys,
 so a crash between listing and persisting can at worst cause a key to be
@@ -37,6 +40,7 @@ a manual `airflow dags trigger`.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -48,7 +52,8 @@ from infrastructure.s3_key_persister import (
     read_manifest_seen_keys,
     validate_watch_prefix,
 )
-from infrastructure.s3_object_lister import list_keys
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_POKE_INTERVAL_SECONDS = 30.0
 
@@ -96,26 +101,41 @@ class S3NewObjectTrigger(BaseEventTrigger):
     async def run(self) -> AsyncIterator[TriggerEvent]:
         """Seeds from the manifest, then polls forever, yielding events before persisting.
 
-        `list_keys`/`compute_seen_diff`/`persist_seen_keys` are plain boto3
-        (synchronous), so each runs in a worker thread via `asyncio.to_thread`
-        rather than blocking the triggerer's event loop, which serves many
-        other triggers concurrently.
+        `compute_seen_diff`/`persist_seen_keys`/`read_manifest_seen_keys` are
+        plain boto3 (synchronous), so each runs in a worker thread via
+        `asyncio.to_thread` rather than blocking the triggerer's event loop,
+        which serves many other triggers concurrently.
 
         Seeding tries `read_manifest_seen_keys` first so a restart resumes
         from what a prior run already recorded. If no valid manifest exists
-        (first run, or it's missing/corrupt/malformed), every currently-listed
-        key is treated as new and fired once, since a duplicate event is cheap
-        and a missed one is not.
+        (first run, missing/corrupt/malformed, or the read itself raises an
+        unexpected error — e.g. a boto3 connection/timeout error, or a
+        `KeyError` from an unset `MINIO_ENDPOINT`), every currently-listed key
+        is treated as new and fired once via `compute_seen_diff(bucket,
+        prefix, set())`, since a duplicate event is cheap and a missed one is
+        not — firing zero events because the seed read blew up would be
+        strictly worse than that fallback.
 
         Each poll computes the diff and yields events for it *before*
         persisting the updated manifest, so a persistence failure can't mark
         a key durably seen that never actually fired.
         """
-        seen = await asyncio.to_thread(read_manifest_seen_keys, self.bucket, self.prefix)
+        try:
+            seen = await asyncio.to_thread(read_manifest_seen_keys, self.bucket, self.prefix)
+        except Exception:
+            logger.exception(
+                "Unexpected failure reading s3_key_persister manifest for "
+                "bucket=%s prefix=%s; falling back to firing every "
+                "currently-listed key.",
+                self.bucket,
+                self.prefix,
+            )
+            seen = None
+
         if seen is None:
-            current = await asyncio.to_thread(list_keys, self.bucket, self.prefix)
-            seen = set(current)
-            new_keys = sorted(current)
+            seen, new_keys = await asyncio.to_thread(
+                compute_seen_diff, self.bucket, self.prefix, set()
+            )
             for key in new_keys:
                 yield TriggerEvent({"bucket": self.bucket, "key": key})
             await asyncio.to_thread(persist_seen_keys, self.bucket, self.prefix, seen, new_keys)
