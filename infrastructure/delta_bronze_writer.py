@@ -74,22 +74,28 @@ class DeltaBronzeWriter:
                 e.g. `2026-08-30`. Quoted into the `replaceWhere` predicate.
             window_column: Name of a finer-grained sub-partition column
                 to additionally scope the overwrite to, e.g.
-                `_ingestion_window`. Must be set together with
-                `window_values`, or left `None` for the current
-                single-partition behavior.
+                `_ingestion_window`. May be set alone, with
+                `window_values` left `None`: the table is still
+                physically partitioned by this column (via
+                `partition_columns`), but the `replaceWhere` overwrite
+                scope stays the full `partition_column` partition — a
+                full-day overwrite, for a caller (e.g. a manual/full-day
+                ingestion run) with no bounded window set of its own to
+                scope to.
             window_values: Values of `window_column` to include in the
-                overwrite scope. Must be set together with
-                `window_column`, or left `None`.
+                overwrite scope. Requires `window_column` to also be
+                set; raises if given without it. Leave both `None` for
+                the plain single-partition overwrite behavior.
 
         Raises:
             ValueError: If `partition_value` or any `window_values`
                 element contains a single-quote character, which would
                 break out of the quoted literal and produce a malformed
-                `replaceWhere` predicate. Also raised if exactly one of
-                `window_column`/`window_values` is set.
+                `replaceWhere` predicate. Also raised if `window_values`
+                is set without `window_column`.
         """
-        if (window_column is None) != (window_values is None):
-            raise ValueError("window_column and window_values must both be set or both be None")
+        if window_values is not None and window_column is None:
+            raise ValueError("window_values requires window_column to also be set")
 
         _validate_no_single_quote(partition_value, "partition_value")
         replace_where = f"{partition_column} = '{partition_value}'"

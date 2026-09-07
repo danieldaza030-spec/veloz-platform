@@ -66,7 +66,7 @@ class TestIngestToBronze:
 
         columns = result.columns
         assert "_extract_date" in columns
-        assert "_ingested_at" in columns
+        assert "_bronze_ingested_at" in columns
         assert "_source_file" in columns
 
     def test_ingest_to_bronze_idempotent(
@@ -458,4 +458,4 @@ class TestIngestCleanRowsToBronze:
         assert bronze.count() == 1
         assert "_corrupt_record" not in bronze.columns
         assert "_source_file" in bronze.columns
-        assert "_ingested_at" in bronze.columns
+        assert "_bronze_ingested_at" in bronze.columns

@@ -24,8 +24,15 @@ cost grow with the day's file count instead of staying constant. The bounded
 lookback (30 minutes of windows) is enough to safely re-cover any window the
 triggerer's own coalescing might have skipped a trigger for, without paying
 day-long reglob cost. A manually triggered run (no triggering Asset event,
-so no window information) falls back to the previous full-day-glob
-behavior, `window_column=None`.
+so no window information) falls back to a full-day glob, but still declares
+`window_column=INGESTION_WINDOW_COLUMN` with `window_values=None` (see
+`_resolve_window_spec`): a Delta table has one fixed partition spec, so
+every run mode has to agree on the same `[_extract_date, _ingestion_window]`
+layout regardless of which one creates the table first, or whichever run
+mode runs second fails outright. `window_values=None` is what tells
+`DeltaBronzeWriter.write` to scope the `replaceWhere` to the whole
+`_extract_date` partition instead of a bounded window set — correct for a
+manual run's full-day read.
 
 This DAG mirrors `dags/ingest_orders_bronze.py` structurally, batch-loading
 the rider-events source the same way orders is batch-loaded, even though
@@ -70,6 +77,7 @@ from dag_defaults import BRONZE_DEFAULT_ARGS
 from infrastructure.s3_new_object_trigger import S3NewObjectTrigger
 from infrastructure.s3_object_lister import list_keys
 from metadata.buckets import Buckets
+from metadata.ingestion_windows import WINDOW_MINUTES
 
 RIDER_EVENTS_RAW_PREFIX = "rider_events"
 RIDER_EVENTS_BRONZE_PREFIX = "rider_events"
@@ -78,11 +86,19 @@ INGESTION_WINDOW_COLUMN = "_ingestion_window"
 DATE_PARTITION_PATTERN = re.compile(r"date=(\d{4}-\d{2}-\d{2})")
 WINDOW_PATTERN = re.compile(r"rider_events_(\d{8}T\d{6}Z)\.jsonl$")
 
-# File cadence is 5 minutes (see generators/s3_io.py's WINDOW_MINUTES); 6
-# windows = 30 minutes of lookback on every Asset-triggered run, enough to
-# safely re-cover a window a triggerer restart might have skipped a trigger
-# for, without approaching the cost of a full-day reglob.
+# `WINDOW_MINUTES` (metadata.ingestion_windows, the one shared cadence
+# constant `dags.ingest_orders_silver` also imports) is the file cadence;
+# 6 windows * WINDOW_MINUTES = 30 minutes of lookback on every
+# Asset-triggered run, enough to safely re-cover a window a triggerer
+# restart might have skipped a trigger for, without approaching the cost
+# of a full-day reglob.
 LOOKBACK_WINDOW_COUNT = 6
+if LOOKBACK_WINDOW_COUNT * WINDOW_MINUTES != 30:
+    raise ValueError(
+        "LOOKBACK_WINDOW_COUNT's 30-minute lookback assumption no longer holds "
+        "for the current WINDOW_MINUTES cadence -- update the count (or this "
+        "assumption) deliberately instead of letting the two silently drift."
+    )
 
 # How many workers/cores this DAG's Spark submission requests from the
 # shared Standalone cluster. Defined per-DAG (rather than left to
@@ -201,6 +217,38 @@ def _resolve_windows_to_ingest(
     return sorted(selected)
 
 
+def _resolve_window_spec(
+    triggering_windows: list[str], windows_read: list[str]
+) -> tuple[str, list[str] | None]:
+    """Determines one target date's uniform `(window_column, window_values)` request pair.
+
+    Every run mode -- Asset-triggered or manual -- partitions Bronze by
+    the same `[EXTRACT_DATE_COLUMN, INGESTION_WINDOW_COLUMN]` spec: a
+    Delta table has one fixed partition layout, so whichever run mode
+    happens to create the table first locks that layout in, and a later
+    run in the *other* mode would fail outright if it disagreed. Only the
+    `replaceWhere` overwrite *scope* differs by mode: an Asset-triggered
+    run bounds it to `windows_read` (the reglob it actually read); a
+    manual run leaves it `None`, which `DeltaBronzeWriter.write` treats as
+    a full-`_extract_date`-partition overwrite, matching its full-day
+    glob read.
+
+    Args:
+        triggering_windows: Window tokens that triggered this run for the
+            target date; empty for a manual run.
+        windows_read: Every window token this run actually read for the
+            target date, both modes -- the bounded lookback set for an
+            Asset-triggered run, or every window token present under the
+            date's raw prefix for a manual run's full-day glob.
+
+    Returns:
+        `(INGESTION_WINDOW_COLUMN, windows_read)` for an Asset-triggered
+        run (`triggering_windows` non-empty), or
+        `(INGESTION_WINDOW_COLUMN, None)` for a manual run.
+    """
+    return INGESTION_WINDOW_COLUMN, (windows_read if triggering_windows else None)
+
+
 @dag(
     dag_id="ingest_rider_events_bronze",
     schedule=[RIDER_EVENTS_RAW_ASSET],
@@ -254,7 +302,16 @@ def ingest_rider_events_bronze():
         try:
             for target_date in target_dates:
                 triggering_windows = windows_by_date.get(target_date, [])
+
                 if triggering_windows:
+                    # Listed only here, not unconditionally: this DAG has no
+                    # outlet consuming windows_read (unlike
+                    # dags.ingest_orders_bronze's identical-looking branch,
+                    # whose manual/full-day path also needs this LIST for
+                    # its ORDERS_BRONZE_ASSET outlet extra), so the manual
+                    # full-day-glob branch below skips this S3 LIST entirely
+                    # rather than paying for it purely to enumerate windows
+                    # in a log line.
                     all_keys = list_keys(
                         Buckets.RAW_INCOMING_DATA, f"{RIDER_EVENTS_RAW_PREFIX}/date={target_date}/"
                     )
@@ -263,25 +320,29 @@ def ingest_rider_events_bronze():
                         for key in all_keys
                         if (match := WINDOW_PATTERN.search(key))
                     }
-                    selected = _resolve_windows_to_ingest(
+                    windows_read = _resolve_windows_to_ingest(
                         sorted(window_by_key.values()),
                         sorted(triggering_windows),
                         LOOKBACK_WINDOW_COUNT,
                     )
-                    selected_set = set(selected)
+                    windows_read_set = set(windows_read)
                     raw_path = [
                         f"s3a://{Buckets.RAW_INCOMING_DATA}/{key}"
                         for key, window in window_by_key.items()
-                        if window in selected_set
+                        if window in windows_read_set
                     ]
-                    window_column = INGESTION_WINDOW_COLUMN
-                    window_values = selected
                 else:
                     raw_path = (
                         f"s3a://{Buckets.RAW_INCOMING_DATA}/{RIDER_EVENTS_RAW_PREFIX}/date={target_date}/*.jsonl"
                     )
-                    window_column = None
-                    window_values = None
+                    # No triggering_windows means _resolve_window_spec below
+                    # ignores this value (falls straight to window_values=None
+                    # for the full-day replaceWhere scope), so there's
+                    # nothing here that needs the windows actually present
+                    # under this date's raw prefix.
+                    windows_read = None
+
+                window_column, window_values = _resolve_window_spec(triggering_windows, windows_read)
 
                 request = BronzeIngestionRequest(
                     raw_path=raw_path,
@@ -301,11 +362,15 @@ def ingest_rider_events_bronze():
 
                 print(f"reading raw rider events extract: {raw_path}")
                 row_count = ingest_to_bronze(spark, request)
+                # Full-day branch logs without enumerating windows -- no
+                # outlet needs that list here (see the comment above), and
+                # windows_read is None on that branch since it's never
+                # computed.
                 print(
                     f"wrote {row_count} rows to {bronze_path} "
-                    f"(partition {EXTRACT_DATE_COLUMN}={target_date}"
-                    + (f", {INGESTION_WINDOW_COLUMN} in {window_values}" if window_values else "")
-                    + ")"
+                    f"(partition {EXTRACT_DATE_COLUMN}={target_date}, "
+                    f"{INGESTION_WINDOW_COLUMN}"
+                    + (f" in {window_values})" if window_values is not None else " full day)")
                 )
         finally:
             spark.stop()

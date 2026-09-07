@@ -2,6 +2,18 @@
 
 from __future__ import annotations
 
+ORDERS_SILVER_PREFIX = "orders"
+"""Bucket-relative path segment for the Silver orders table
+(`s3a://{Buckets.SILVER}/{ORDERS_SILVER_PREFIX}/`). Shared by `dags.
+ingest_orders_silver` (writes/merges into it) and `dags.
+maintain_orders_silver` (OPTIMIZE/VACUUMs it) so the two DAGs, which target
+the exact same physical table, can never disagree on its path. Kept as a
+plain module-level constant here rather than in `metadata.
+orders_silver_schema` -- that module imports `pyspark.sql.types` at its own
+top level, which would drag a real pyspark import into both DAGs' module
+scope (both otherwise defer every pyspark-touching import to inside their
+`@task` function bodies -- see each DAG's own docstring)."""
+
 
 class Buckets:
     """Bucket name constants for the Veloz lakehouse."""

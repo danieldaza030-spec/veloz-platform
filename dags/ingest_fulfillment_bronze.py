@@ -28,7 +28,7 @@ Clean rows land in the Delta table at `s3a://bronze-veloz/fulfillment/`,
 partitioned on the raw `date` column the schema already carries (one
 export date per row) rather than a synthetic `_extract_date` — fulfillment
 doesn't need a derived lineage column duplicating data it already has, so
-`derive_partition_column=False` leaves that column as read. `_ingested_at`
+`derive_partition_column=False` leaves that column as read. `_bronze_ingested_at`
 and `_source_file` lineage columns are added the same way orders does.
 Quarantine records accumulate at `s3a://bronze-veloz/_quarantine/fulfillment/`
 (see `docs/bronze-conventions.md`) and are never overwritten by later runs.

@@ -24,8 +24,31 @@ cost grow with the day's file count instead of staying constant. The bounded
 lookback (30 minutes of windows) is enough to safely re-cover any window the
 triggerer's own coalescing might have skipped a trigger for, without paying
 day-long reglob cost. A manually triggered run (no triggering Asset event,
-so no window information) falls back to the previous full-day-glob
-behavior, `window_column=None`.
+so no window information) falls back to a full-day glob, but still declares
+`window_column=INGESTION_WINDOW_COLUMN` with `window_values=None` (see
+`_resolve_window_spec`): a Delta table has one fixed partition spec, so
+every run mode has to agree on the same `[_extract_date, _ingestion_window]`
+layout regardless of which one creates the table first, or whichever run
+mode runs second fails outright. `window_values=None` is what tells
+`DeltaBronzeWriter.write` to scope the `replaceWhere` to the whole
+`_extract_date` partition instead of a bounded window set — correct for a
+manual run's full-day read.
+
+Beyond consuming `ORDERS_RAW_ASSET`, this DAG also produces
+`ORDERS_BRONZE_ASSET`, declared as `run()`'s only outlet: a plain Asset (no
+watcher of its own) a downstream Silver DAG can schedule off via
+`schedule=[ORDERS_BRONZE_ASSET]`, distinct from `ORDERS_RAW_ASSET`'s
+watcher-driven consumption above -- one is a custom-triggered *consumer*
+mechanism, the other a plain outlet-event *producer* mechanism, not two
+names for the same thing. Each run publishes
+`outlet_events[ORDERS_BRONZE_ASSET].extra = {"extract_dates": [...],
+"windows": [...]}` naming exactly the `_extract_date` values and
+`_ingestion_window` tokens this run actually wrote (not what it intended
+to write): window tokens are the same `%Y%m%dT%H%M%SZ`-formatted string
+`WINDOW_PATTERN`/`add_lineage_columns` already derive from each raw
+window-file's name, e.g. `"20260905T191000Z"`, so a Silver consumer can
+filter its own read directly on that token instead of rereading the whole
+table.
 
 This is platform-layer logic (Bronze schema normalization), not infra glue —
 built here only because the engineer explicitly opted to change the usual
@@ -72,6 +95,7 @@ from dag_defaults import BRONZE_DEFAULT_ARGS
 from infrastructure.s3_new_object_trigger import S3NewObjectTrigger
 from infrastructure.s3_object_lister import list_keys
 from metadata.buckets import Buckets
+from metadata.ingestion_windows import WINDOW_MINUTES
 
 ORDERS_RAW_PREFIX = "orders"
 ORDERS_BRONZE_PREFIX = "orders"
@@ -80,11 +104,19 @@ INGESTION_WINDOW_COLUMN = "_ingestion_window"
 DATE_PARTITION_PATTERN = re.compile(r"date=(\d{4}-\d{2}-\d{2})")
 WINDOW_PATTERN = re.compile(r"orders_(\d{8}T\d{6}Z)\.csv$")
 
-# File cadence is 5 minutes (see generators/s3_io.py's WINDOW_MINUTES); 6
-# windows = 30 minutes of lookback on every Asset-triggered run, enough to
-# safely re-cover a window a triggerer restart might have skipped a trigger
-# for, without approaching the cost of a full-day reglob.
+# `WINDOW_MINUTES` (metadata.ingestion_windows, the one shared cadence
+# constant `dags.ingest_orders_silver` also imports) is the file cadence;
+# 6 windows * WINDOW_MINUTES = 30 minutes of lookback on every
+# Asset-triggered run, enough to safely re-cover a window a triggerer
+# restart might have skipped a trigger for, without approaching the cost
+# of a full-day reglob.
 LOOKBACK_WINDOW_COUNT = 6
+if LOOKBACK_WINDOW_COUNT * WINDOW_MINUTES != 30:
+    raise ValueError(
+        "LOOKBACK_WINDOW_COUNT's 30-minute lookback assumption no longer holds "
+        "for the current WINDOW_MINUTES cadence -- update the count (or this "
+        "assumption) deliberately instead of letting the two silently drift."
+    )
 
 # How many workers/cores this DAG's Spark submission requests from the
 # shared Standalone cluster. Defined per-DAG (rather than left to
@@ -102,6 +134,14 @@ ORDERS_RAW_ASSET = Asset(
         )
     ],
 )
+
+# Bronze->Silver producer/consumer asset: no watcher of its own (unlike
+# ORDERS_RAW_ASSET above), just an outlet a downstream Silver DAG schedules
+# off of. Kept as a separate Asset object rather than reusing ORDERS_RAW_ASSET
+# -- the two represent different stages of the pipeline and different
+# triggering mechanisms (custom S3NewObjectTrigger watcher vs. plain outlet
+# event), not the same dependency.
+ORDERS_BRONZE_ASSET = Asset(f"s3://{Buckets.BRONZE}/{ORDERS_BRONZE_PREFIX}/")
 
 
 def _extract_dates_from_triggering_event(context: dict) -> list[str]:
@@ -203,6 +243,38 @@ def _resolve_windows_to_ingest(
     return sorted(selected)
 
 
+def _resolve_window_spec(
+    triggering_windows: list[str], windows_read: list[str]
+) -> tuple[str, list[str] | None]:
+    """Determines one target date's uniform `(window_column, window_values)` request pair.
+
+    Every run mode -- Asset-triggered or manual -- partitions Bronze by
+    the same `[EXTRACT_DATE_COLUMN, INGESTION_WINDOW_COLUMN]` spec: a
+    Delta table has one fixed partition layout, so whichever run mode
+    happens to create the table first locks that layout in, and a later
+    run in the *other* mode would fail outright if it disagreed. Only the
+    `replaceWhere` overwrite *scope* differs by mode: an Asset-triggered
+    run bounds it to `windows_read` (the reglob it actually read); a
+    manual run leaves it `None`, which `DeltaBronzeWriter.write` treats as
+    a full-`_extract_date`-partition overwrite, matching its full-day
+    glob read.
+
+    Args:
+        triggering_windows: Window tokens that triggered this run for the
+            target date; empty for a manual run.
+        windows_read: Every window token this run actually read for the
+            target date, both modes -- the bounded lookback set for an
+            Asset-triggered run, or every window token present under the
+            date's raw prefix for a manual run's full-day glob.
+
+    Returns:
+        `(INGESTION_WINDOW_COLUMN, windows_read)` for an Asset-triggered
+        run (`triggering_windows` non-empty), or
+        `(INGESTION_WINDOW_COLUMN, None)` for a manual run.
+    """
+    return INGESTION_WINDOW_COLUMN, (windows_read if triggering_windows else None)
+
+
 @dag(
     dag_id="ingest_orders_bronze",
     schedule=[ORDERS_RAW_ASSET],
@@ -225,7 +297,7 @@ def _resolve_windows_to_ingest(
     },
 )
 def ingest_orders_bronze():
-    @task
+    @task(outlets=[ORDERS_BRONZE_ASSET])
     def run() -> None:
         # plugins/ is on sys.path for every DAG/task (see spark_session's own
         # bare-name import above); metadata/ is mounted as a subdirectory of
@@ -253,35 +325,52 @@ def ingest_orders_bronze():
             ),
         ).get_session()
 
+        # Accumulated across every target_date this run actually wrote, for
+        # the ORDERS_BRONZE_ASSET outlet event published below -- exactly
+        # what landed in Bronze this run, not what a given date's request
+        # merely intended to write.
+        written_extract_dates: list[str] = []
+        written_windows: set[str] = set()
+
         try:
             for target_date in target_dates:
                 triggering_windows = windows_by_date.get(target_date, [])
+                # Listed unconditionally (not just for an Asset-triggered
+                # date): the triggered branch below needs this set to build
+                # raw_path; the manual full-day-glob branch needs it too,
+                # not merely to log, but to report the windows it ACTUALLY
+                # covered in the ORDERS_BRONZE_ASSET outlet extra published
+                # at the end of this run -- that reporting has to stay
+                # accurate, so this LIST can't be skipped on that branch
+                # the way dags.ingest_rider_events_bronze's identical call
+                # can (that DAG has no outlet consuming windows_read; see
+                # its own matching comment).
+                all_keys = list_keys(
+                    Buckets.RAW_INCOMING_DATA, f"{ORDERS_RAW_PREFIX}/date={target_date}/"
+                )
+                window_by_key = {
+                    key: match.group(1)
+                    for key in all_keys
+                    if (match := WINDOW_PATTERN.search(key))
+                }
+
                 if triggering_windows:
-                    all_keys = list_keys(
-                        Buckets.RAW_INCOMING_DATA, f"{ORDERS_RAW_PREFIX}/date={target_date}/"
-                    )
-                    window_by_key = {
-                        key: match.group(1)
-                        for key in all_keys
-                        if (match := WINDOW_PATTERN.search(key))
-                    }
-                    selected = _resolve_windows_to_ingest(
+                    windows_read = _resolve_windows_to_ingest(
                         sorted(window_by_key.values()),
                         sorted(triggering_windows),
                         LOOKBACK_WINDOW_COUNT,
                     )
-                    selected_set = set(selected)
+                    windows_read_set = set(windows_read)
                     raw_path = [
                         f"s3a://{Buckets.RAW_INCOMING_DATA}/{key}"
                         for key, window in window_by_key.items()
-                        if window in selected_set
+                        if window in windows_read_set
                     ]
-                    window_column = INGESTION_WINDOW_COLUMN
-                    window_values = selected
                 else:
                     raw_path = f"s3a://{Buckets.RAW_INCOMING_DATA}/{ORDERS_RAW_PREFIX}/date={target_date}/*.csv"
-                    window_column = None
-                    window_values = None
+                    windows_read = sorted(window_by_key.values())
+
+                window_column, window_values = _resolve_window_spec(triggering_windows, windows_read)
 
                 request = BronzeIngestionRequest(
                     raw_path=raw_path,
@@ -302,14 +391,31 @@ def ingest_orders_bronze():
 
                 print(f"reading raw orders extract: {raw_path}")
                 row_count = ingest_to_bronze(spark, request)
+                # Full-day branch logs a window count, not the enumerated
+                # list -- windows_read can run to hundreds of tokens for a
+                # full day and isn't worth spelling out in a log line; the
+                # ORDERS_BRONZE_ASSET outlet extra below is where the exact
+                # list actually gets reported.
                 print(
                     f"wrote {row_count} rows to {bronze_path} "
-                    f"(partition {EXTRACT_DATE_COLUMN}={target_date}"
-                    + (f", {INGESTION_WINDOW_COLUMN} in {window_values}" if window_values else "")
-                    + ")"
+                    f"(partition {EXTRACT_DATE_COLUMN}={target_date}, "
+                    f"{INGESTION_WINDOW_COLUMN}"
+                    + (
+                        f" in {window_values})"
+                        if window_values is not None
+                        else f" full day, {len(windows_read)} windows)"
+                    )
                 )
+
+                written_extract_dates.append(target_date)
+                written_windows.update(windows_read)
         finally:
             spark.stop()
+
+        context["outlet_events"][ORDERS_BRONZE_ASSET].extra = {
+            "extract_dates": written_extract_dates,
+            "windows": sorted(written_windows),
+        }
 
     run()
 

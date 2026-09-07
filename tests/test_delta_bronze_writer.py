@@ -56,17 +56,8 @@ class TestDeltaBronzeWriterValidation:
                 window_values=["20260830T000000Z'; DROP TABLE --"],
             )
 
-    @pytest.mark.parametrize(
-        ("window_column", "window_values"),
-        [
-            pytest.param("_ingestion_window", None, id="column_without_values"),
-            pytest.param(None, ["20260830T000000Z"], id="values_without_column"),
-        ],
-    )
-    def test_mismatched_window_column_and_values_raises_error(
-        self, window_column: str | None, window_values: list[str] | None
-    ) -> None:
-        """Verify ValueError is raised when only one of window_column/window_values is set."""
+    def test_window_values_without_window_column_raises_error(self) -> None:
+        """Verify ValueError is raised when window_values is set without window_column."""
         writer = DeltaBronzeWriter(
             path="/tmp/test",
             partition_columns=["_extract_date"],
@@ -77,14 +68,14 @@ class TestDeltaBronzeWriterValidation:
 
         with pytest.raises(
             ValueError,
-            match=r"window_column and window_values must both be set or both be None",
+            match=r"window_values requires window_column to also be set",
         ):
             writer.write(
                 MockDF(),  # type: ignore
                 partition_column="_extract_date",
                 partition_value="2026-08-30",
-                window_column=window_column,
-                window_values=window_values,
+                window_column=None,
+                window_values=["20260830T000000Z"],
             )
 
 
@@ -140,3 +131,68 @@ class TestDeltaBronzeWriterWindowOverwrite:
         assert result.count() == 2
         assert rows["20260905T000000Z"] == "999"
         assert rows["20260905T000500Z"] == "200"
+
+
+class TestDeltaBronzeWriterWindowColumnWithoutValues:
+    """Test the `window_column` set alone (no `window_values`) full-day overwrite path."""
+
+    def test_replaces_whole_day_partition_across_all_windows(
+        self, spark_session: SparkSession, temp_delta_path: str
+    ) -> None:
+        """window_column alone still partitions by window, but replaceWhere scopes the whole day."""
+        raw_dir = Path(temp_delta_path) / "raw"
+        raw_dir.mkdir()
+
+        first_csv = raw_dir / "first.csv"
+        first_csv.write_text(
+            "_extract_date,_ingestion_window,value\n"
+            "2026-09-05,20260905T000000Z,100\n"
+            "2026-09-05,20260905T000500Z,200\n"
+            "2026-09-06,20260906T000000Z,300\n"
+        )
+
+        bronze_path = str(Path(temp_delta_path) / "bronze")
+        writer = DeltaBronzeWriter(
+            path=bronze_path,
+            partition_columns=["_extract_date", "_ingestion_window"],
+        )
+
+        first_df = spark_session.read.format("csv").option("header", "true").load(str(first_csv))
+        # No single-quote validation error and no partition-mismatch error:
+        # window_column set, window_values left None.
+        writer.write(
+            first_df,
+            partition_column="_extract_date",
+            partition_value="2026-09-05",
+            window_column="_ingestion_window",
+            window_values=None,
+        )
+
+        result = spark_session.read.format("delta").load(bronze_path)
+        assert result.count() == 3
+
+        # A second, full-day-glob re-run for the same date carries only one
+        # of that day's windows -- since window_values is None, the
+        # replaceWhere scope is the whole `_extract_date` partition, so the
+        # window not present in this run's data must be dropped, not kept.
+        second_csv = raw_dir / "second.csv"
+        second_csv.write_text("_extract_date,_ingestion_window,value\n2026-09-05,20260905T999900Z,999\n")
+        second_df = spark_session.read.format("csv").option("header", "true").load(str(second_csv))
+        writer.write(
+            second_df,
+            partition_column="_extract_date",
+            partition_value="2026-09-05",
+            window_column="_ingestion_window",
+            window_values=None,
+        )
+
+        result = spark_session.read.format("delta").load(bronze_path)
+        rows_by_date = {}
+        for row in result.collect():
+            rows_by_date.setdefault(row["_extract_date"], {})[row["_ingestion_window"]] = row["value"]
+
+        # 2026-09-06 partition is untouched by a replaceWhere scoped to 2026-09-05.
+        assert rows_by_date["2026-09-06"] == {"20260906T000000Z": "300"}
+        # 2026-09-05's whole-day scope replaced both prior windows with the
+        # single window this run's data actually carried.
+        assert rows_by_date["2026-09-05"] == {"20260905T999900Z": "999"}

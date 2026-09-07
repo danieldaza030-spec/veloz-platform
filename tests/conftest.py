@@ -86,13 +86,17 @@ def _exec_dag_pure_symbols(dag_path: Path, names: set[str], namespace: dict) -> 
     constants/functions defined in a DAG module (no dependency on Airflow,
     Spark, or any DAG-scoped object) are unit-tested by parsing the
     module's source with `ast` and exec'ing only the requested top-level
-    `Assign`/`FunctionDef` nodes into an isolated namespace, leaving every
-    Airflow-dependent line of the module untouched and unimported.
+    `Assign`/`FunctionDef`/`ImportFrom` nodes into an isolated namespace,
+    leaving every Airflow-dependent line of the module untouched and
+    unimported. `ImportFrom` is included alongside `Assign` so a constant a
+    DAG module re-exports via `from metadata.some_module import NAME`
+    (e.g. a shared constant hoisted out of the DAG file) is just as
+    extractable by name as one still defined with a literal `Assign`.
 
     Args:
         dag_path: Path to the DAG module's source file.
-        names: Names of the top-level assignment targets or function
-            definitions to pull out of the module.
+        names: Names of the top-level assignment targets, function
+            definitions, or imported names to pull out of the module.
         namespace: Namespace to exec the selected nodes into; also supplies
             any names those nodes need at exec time (e.g. `re`).
 
@@ -107,6 +111,10 @@ def _exec_dag_pure_symbols(dag_path: Path, names: set[str], namespace: dict) -> 
         or (
             isinstance(node, ast.Assign)
             and any(isinstance(target, ast.Name) and target.id in names for target in node.targets)
+        )
+        or (
+            isinstance(node, ast.ImportFrom)
+            and any((alias.asname or alias.name) in names for alias in node.names)
         )
     ]
     module = ast.Module(body=wanted, type_ignores=[])

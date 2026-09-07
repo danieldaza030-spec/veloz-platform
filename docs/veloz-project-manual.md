@@ -27,10 +27,10 @@ four sources join).*
 
 | Day | Focus | Ends with | Status |
 |---|---|---|---|
-| 1 | Architecture decision + orders ingestion | ADR written, Airflow local-dev up, orders Bronze + Silver tables | ADR + Airflow **done**; orders Bronze + Silver **not started** |
-| 2 | The fulfillment feed | Fulfillment Bronze + Silver tables, `--bad-night` files quarantined at Bronze instead of dropped/crashing | Not started |
+| 1 | Architecture decision + orders ingestion | ADR written, Airflow local-dev up, orders Bronze + Silver tables | ADR + Airflow **done**; orders Bronze + Silver **done** |
+| 2 | The fulfillment feed | Fulfillment Bronze + Silver tables, `--bad-night` files quarantined at Bronze instead of dropped/crashing | Fulfillment Bronze **done**; Silver **not started** |
 | 3 | Finance reconciliation + dashboard | A reconciliation report you can defend, one query rewrite made faster on purpose | Not started |
-| 4 | MinIO | Bronze/Silver/Gold on object storage | Not started |
+| 4 | MinIO | Bronze/Silver/Gold on object storage | **Done** (2026-08-28) |
 | 5 | Kafka | Live message flow from the rider-events generator into a topic | Not started |
 | 6-7 | Streaming into the lakehouse | A streaming job proven correct under load, not just "it ran" | Not started |
 | 8 | Buffer + Delta deep features | Time-travel query answering a real question | Not started |
@@ -230,7 +230,7 @@ table as the finish line, and quietly skip landing a Bronze table on the way
 Bronze is deliberately dumb: land each source's raw extract into a Delta
 table close to as-is (schema-on-write, no dedup, no business rules, no
 joins — that's Silver's job), plus a couple of ingestion-metadata columns
-(e.g. `_ingested_at`, `_source_file`) so you always know when and from what
+(e.g. `_bronze_ingested_at`, `_source_file`) so you always know when and from what
 file a row came from. Two things this buys you, both tied to a specific
 stakeholder ask, not "best practice" for its own sake:
 - **G2 (Julián's audit requirement):** if Silver logic has a bug and you
@@ -242,12 +242,13 @@ stakeholder ask, not "best practice" for its own sake:
   Delta, not re-hitting the raw CSV/extract — which matters once quarantine
   and retries are in the picture (Day 2).
 
-**Status:** not built yet — this is the actual first Airflow task in the
-`orders` DAG, before any Silver logic runs. Nothing under `dags/` writes to
-a Bronze table today; the four generator DAGs only produce the raw files in
-`data/raw/`, they don't ingest them.
+**Status:** live for orders, fulfillment, and rider_events (payments Bronze
+is still unbuilt). `dags/ingest_orders_bronze.py`,
+`dags/ingest_fulfillment_bronze.py`, and `dags/ingest_rider_events_bronze.py`
+each read that source's raw files from MinIO's `raw-incoming-data` bucket
+and write Delta to `s3a://bronze-veloz/<source>/`.
 
-### Orders ingestion — Bronze, then Silver (your next piece to build)
+### Orders ingestion — Bronze, then Silver (target spec — now satisfied, see below)
 
 Orders arrive as a periodic extract (`docs/data-sources.md` has the exact
 schema): one row per order reflecting its state as of extract time, not a
@@ -256,15 +257,110 @@ order will legitimately appear across more than one extract as it
 progresses through its lifecycle — that's the real shape of this problem,
 not an injected trap.
 
-**Bronze target:** every row from every `orders_<date>.csv` you've run
-lands in `bronze.orders`, untouched (yes, including the repeated rows for
-an order that appears across multiple extracts — dedup is Silver's job, not
-Bronze's), tagged with ingestion metadata.
+**Bronze target:** every row from every `orders_<run_timestamp>.csv`
+5-minute-window file landing in MinIO's `raw-incoming-data` bucket lands in
+the Delta table at `s3a://bronze-veloz/orders/`, untouched (yes, including
+the repeated rows for an order that appears across multiple extracts —
+dedup is Silver's job, not Bronze's), tagged with ingestion metadata.
 
 **Silver target (self-checkable):**
 - `SELECT order_id, COUNT(*) FROM silver.orders GROUP BY order_id HAVING COUNT(*) > 1` returns zero rows once you've ingested more than one day's extract for overlapping orders.
 - For an order captured at multiple lifecycle points, Silver keeps the row reflecting the *most advanced business state*.
 - A validation query that would catch a regression in this logic later — a real test, not a one-off check.
+
+These now hold — see "Orders ingestion — Silver (built, 2026-09-07)" below
+for how.
+
+### Orders ingestion — Silver (built, 2026-09-07)
+
+Silver's orders table lives at `s3a://silver-veloz/orders/`, one row per
+`order_id`, reflecting that order's *current* lifecycle state. An order's
+lifecycle (`created → assigned → picked_up → delivered`/`cancelled`)
+doesn't arrive in one shot — extracts are periodic, so the same order shows
+up spread across many 5-minute Bronze ingestion windows as it progresses.
+Silver's job is to accumulate evidence for that order across every window
+it's ever appeared in, not to keep "whichever row is newest" — see
+`docs/ADR.md`'s Silver appendix ("Grain: accumulating snapshot, not
+latest-row-wins") for why a plain newest-row-wins dedup doesn't work here.
+
+**The column classes** — how to read a Silver row when something looks
+off:
+- **Sticky** (`created_at`, `assigned_at`, `picked_up_at`, `delivered_at`,
+  `cancelled_at`): filled in the first time a value is seen, never blanked
+  afterward — a late-arriving window can fill a gap, but can't erase an
+  already-set value. `cancelled_at` has no Bronze-source column of its
+  own; Silver derives it as the timestamp of the first row that reaches
+  `status == "cancelled"`.
+- **Latest-wins** (`status`, `rider_id`, `store_id`, `order_total`,
+  `updated_at`): only overwritten when the incoming batch's `updated_at`
+  is genuinely newer than what Silver already holds — no fallback.
+- **Audit** — `_silver_ingested_at` refreshes on every write (insert or
+  update); `_silver_first_seen_at` is set once, on first insert, and never
+  touched again. `_bronze_ingested_at` is carried forward for lineage only,
+  never as a filter key: Bronze can rewrite the same row up to 6 times
+  across its own lookback window, restamping that column each time, so
+  filtering an incremental Silver read on it would be non-deterministic
+  across reruns (see the ADR appendix's "Incremental filter key" section).
+
+**How it's triggered.** `dags/ingest_orders_bronze.py` publishes
+`ORDERS_BRONZE_ASSET` on every run, tagged with the `extract_dates`/
+`windows` it actually wrote. `dags/ingest_orders_silver.py` is
+Asset-scheduled off `ORDERS_BRONZE_ASSET` and unions the extras from
+*every* triggering event, not just the latest one. Keep this distinct from
+`ORDERS_RAW_ASSET` — the `S3NewObjectTrigger`-watched Asset that polls
+MinIO for new raw files and triggers Bronze: one watches an external raw
+feed, the other announces what a task inside this pipeline already wrote.
+
+**Rerunning Silver by hand.** `ingest_orders_silver` takes two mutually
+exclusive manual-trigger param modes:
+- `mode="ingestion_window"` with `window_start`/`window_end` as
+  `%Y%m%dT%H%M%SZ` tokens, e.g. `window_start=20260907T013000Z`,
+  `window_end=20260907T014500Z` — reprocesses every 5-minute window in
+  that inclusive range.
+- `mode="extract_date"` with `extract_dates` as a list, e.g.
+  `extract_dates=["2026-09-05", "2026-09-06"]` — reprocesses whole
+  `_extract_date` partitions.
+
+Precedence: an explicit `params["mode"]` always wins over whatever
+triggered the run; with no explicit mode, Silver falls back to the union
+of the triggering `ORDERS_BRONZE_ASSET` event extras; with neither, it
+raises `ValueError` — never a silent "today" or "everything" default.
+
+**Maintenance.** `dags/maintain_orders_silver.py` runs daily at 06:30
+UTC — off-peak for all three markets and comfortably ahead of Finance's
+8am-local deadline in every one of them — doing `OPTIMIZE ... ZORDER BY
+(order_id, store_id)` then `VACUUM` at Delta's default 168-hour retention.
+It's a separate DAG because `ingest_orders_silver`'s MERGE runs dozens of
+times a day and needs to stay fast per batch, not pay a full-table
+OPTIMIZE/VACUUM cost on every trigger.
+
+**Running the tests** — currently tribal knowledge, written down here:
+the host's default JVM (Temurin 26) breaks every PySpark `SparkSession`
+creation, so any Spark-touching test needs JDK 17 pointed at explicitly:
+```
+JAVA_HOME=/opt/homebrew/Cellar/openjdk@17/17.0.20/libexec/openjdk.jdk/Contents/Home .venv/bin/python -m pytest -q tests/
+```
+The container path (real Airflow, Python 3.11) needs an ad-hoc mount,
+since `tests/` isn't mounted into the image and pytest isn't installed
+there:
+```
+docker compose run --rm --no-deps -v "$(pwd)/tests:/opt/airflow/tests" --entrypoint /bin/bash airflow-scheduler -c "pip install --no-cache-dir --quiet pytest==9.1.1 && cd /opt/airflow && python -m pytest -q tests/"
+```
+Both currently report 162 passed / 2 failed (pre-existing, unrelated to
+Silver). Pass `tests/` explicitly in both — bare `pytest` fails collection
+on `dags/*_smoke_test.py`.
+
+**Known limitations**, short version — full detail in the ADR appendix's
+"Explicitly deferred" section:
+- A sticky column can never be reset to `NULL` once set, so an upstream
+  correction-by-nulling (e.g. clearing a wrong `delivered_at`) is ignored.
+- Status regressions are applied silently — latest-wins just takes the
+  newer batch's value, even when it's an earlier lifecycle status than
+  what Silver already holds. Detection is deferred.
+- Two pre-existing quarantine bugs in `application/bronze_ingestion.py`
+  mean a malformed row can currently enter Bronze marked clean, and with
+  Silver now MERGEing off Bronze, that bad row becomes persistent order
+  state instead of a one-off defect in a single day's extract.
 
 ---
 
@@ -281,8 +377,8 @@ aside instead of crashing the DAG" is Bronze-ingestion logic, not a
 cleaning rule. Silver only ever sees rows that made it into Bronze clean.
 
 **Bronze target:**
-- Every store file that parses at all lands in `bronze.fulfillment`,
-  untouched, with ingestion metadata.
+- Every store file that parses at all lands in the Delta table at
+  `s3a://bronze-veloz/fulfillment/`, untouched, with ingestion metadata.
 - A missing file for a (store, date) or a row `pandas.read_csv` can't parse
   is logged to a quarantine location (table or path — your call, documented)
   instead of silently dropped or crashing the task.
@@ -336,11 +432,15 @@ FROM orders o
 
 ---
 
-## Day 4 — Your own private S3 (MinIO)
+## Day 4 — Your own private S3 (MinIO) — built, 2026-08-28
 
 **Learn first:** what S3-compatible object storage buys you over local disk; the `s3a://` connector config — budget extra time, this remains the one genuinely fiddly step, and it's a legitimate full-delegate task if it fights you.
 
-**Build:** add MinIO to your compose file, create a `veloz` bucket, repoint Bronze/Silver/Gold writes at `s3a://veloz/...`, re-run everything against the new backend.
+**Built:** MinIO added to the compose file, with three layer buckets —
+`bronze-veloz`/`silver-veloz`/`gold-veloz` — plus a separate
+`raw-incoming-data` bucket as the landing zone for the generators' raw
+files. Bronze/Silver/Gold writes are repointed at
+`s3a://<layer>-veloz/...` accordingly.
 
 **What you'll see:** the MinIO console filling with real Delta/Parquet files as your DAGs run.
 

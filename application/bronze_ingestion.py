@@ -107,13 +107,13 @@ def add_lineage_columns(
 
     Returns:
         `df` with `partition_column` (as a `date`, when derived),
-        `_ingested_at`, `_source_file` (when derived), and
+        `_bronze_ingested_at`, `_source_file` (when derived), and
         `window_column` (when given) columns added.
     """
     tagged = df
     if derive_partition_column:
         tagged = tagged.withColumn(partition_column, lit(extract_date).cast("date"))
-    tagged = tagged.withColumn("_ingested_at", current_timestamp())
+    tagged = tagged.withColumn("_bronze_ingested_at", current_timestamp())
     if derive_source_file:
         tagged = tagged.withColumn("_source_file", input_file_name())
     if window_column is not None:

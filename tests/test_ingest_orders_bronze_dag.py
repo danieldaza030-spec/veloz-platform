@@ -75,3 +75,77 @@ class TestIngestOrdersBronzeDAGImport:
 
         assert len(dag_functions) > 0, "Should have at least one @dag decorated function"
         assert "ingest_orders_bronze" in dag_functions, "Should have ingest_orders_bronze() function"
+
+    def test_dag_defines_orders_bronze_asset(self) -> None:
+        """Verify ORDERS_BRONZE_ASSET is defined, separate from ORDERS_RAW_ASSET."""
+        dag_path = Path(__file__).parent.parent / "dags" / "ingest_orders_bronze.py"
+
+        with open(dag_path) as f:
+            source_code = f.read()
+
+        tree = ast.parse(source_code)
+
+        top_level_assign_targets = {
+            target.id
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+
+        assert "ORDERS_RAW_ASSET" in top_level_assign_targets
+        assert "ORDERS_BRONZE_ASSET" in top_level_assign_targets, "Should define a distinct ORDERS_BRONZE_ASSET"
+
+    def test_run_task_declares_orders_bronze_asset_outlet(self) -> None:
+        """Verify the `run` task's @task decorator declares outlets=[ORDERS_BRONZE_ASSET]."""
+        dag_path = Path(__file__).parent.parent / "dags" / "ingest_orders_bronze.py"
+
+        with open(dag_path) as f:
+            source_code = f.read()
+
+        tree = ast.parse(source_code)
+
+        run_functions = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "run"]
+        assert len(run_functions) == 1, "Should define exactly one `run` task function"
+        run_function = run_functions[0]
+
+        outlets_values: list[ast.expr] = []
+        for decorator in run_function.decorator_list:
+            if (
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Name)
+                and decorator.func.id == "task"
+            ):
+                for keyword in decorator.keywords:
+                    if keyword.arg == "outlets":
+                        outlets_values.append(keyword.value)
+
+        assert outlets_values, "The `run` task's @task decorator should declare outlets="
+        outlets_list = outlets_values[0]
+        assert isinstance(outlets_list, ast.List)
+        outlet_names = [elt.id for elt in outlets_list.elts if isinstance(elt, ast.Name)]
+        assert outlet_names == ["ORDERS_BRONZE_ASSET"]
+
+    def test_run_task_publishes_outlet_event_extra(self) -> None:
+        """Verify `run` sets outlet_events[ORDERS_BRONZE_ASSET].extra with extract_dates/windows keys."""
+        dag_path = Path(__file__).parent.parent / "dags" / "ingest_orders_bronze.py"
+
+        with open(dag_path) as f:
+            source_code = f.read()
+
+        assert "outlet_events" in source_code
+        assert 'context["outlet_events"][ORDERS_BRONZE_ASSET].extra' in source_code
+
+        tree = ast.parse(source_code)
+        extra_assignments = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Attribute) and target.attr == "extra"
+        ]
+        assert len(extra_assignments) == 1
+        extra_dict = extra_assignments[0].value
+        assert isinstance(extra_dict, ast.Dict)
+        extra_keys = [key.value for key in extra_dict.keys if isinstance(key, ast.Constant)]
+        assert set(extra_keys) == {"extract_dates", "windows"}

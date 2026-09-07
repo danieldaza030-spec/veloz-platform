@@ -16,17 +16,18 @@ rules.
 
 ## Right now
 
-- **Current focus:** orders and rider_events now generate data every 5 minutes
-  (previously daily). Fulfillment and payments remain daily per business rules.
-  `ingest_orders_bronze` now catches up to that cadence via Asset-based
-  scheduling instead of a daily cron. Next up: Bronze ingestion for
-  fulfillment/payments/rider_events, then Silver.
+- **Current focus:** Bronze is live for orders, fulfillment, and
+  rider_events; payments Bronze ingestion is still unbuilt. Orders → Silver
+  is now live too (`dags/ingest_orders_silver.py` +
+  `dags/maintain_orders_silver.py`, Asset-scheduled off Bronze — see
+  `docs/ADR.md`'s new appendix for the design reasoning).
 - **Currently working on:** nothing in progress.
 - **Blocked on:** nothing.
-- **Next step:** Bronze ingestion for fulfillment/payments/rider_events
-  (fulfillment specifically needs its `--bad-night` quarantine logic decided
-  at this same read step, not deferred to Silver — see the manual's Bronze
-  explainer), then Silver for orders.
+- **Next step:** payments Bronze ingestion, then Fulfillment → Silver. Two
+  pre-existing quarantine bugs were flagged during the Silver work
+  (`application/bronze_ingestion.py` — see the 2026-09-07 session log entry
+  and `docs/ADR.md`'s appendix) and are worth fixing before Silver depends on
+  any more Bronze source.
 
 ## Data sources (emulation build status)
 
@@ -49,7 +50,7 @@ test it, be able to explain it.
 | Milestone | Target | Status |
 |---|---|---|
 | Orders → Bronze | Raw extract schema-applied and landed in Delta, append-only per extract date | [x] |
-| Orders → Silver | One row per order, deduplicated against re-extracts over time | [ ] |
+| Orders → Silver | One row per order, deduplicated against re-extracts over time | [x] |
 | Fulfillment → Silver | One row per (store, sku, date), quarantine for `--bad-night` malformed/missing files | [ ] |
 | Payments reconciliation | Recomputed commission vs. actual, missing payments, lag outliers — all flagged, not hidden | [ ] |
 | Ops-facing status view | Store/rider status, a few minutes of lag, not an hour | [ ] |
@@ -62,14 +63,15 @@ test it, be able to explain it.
 |---|---|
 | Airflow local-dev (docker-compose, custom image) | [x] |
 | Airflow upgraded to 3.3.1 (api-server/dag-processor/triggerer topology) | [x] |
-| Generator-orchestration DAGs (`dags/generate_*.py`, one per source, interactive Params) | [x] |
+| Generator-orchestration DAGs (`dags/generate_*.py`, interactive Params; orders+rider_events now share one DAG, fulfillment/payments each their own) | [x] |
 | Day 1 ADR written | [x] |
 | MinIO + `s3a://` — Bronze/Silver/Gold repointed | [x] |
 | Generators → MinIO `raw-incoming-data` landing zone | [x] |
 | Spark Standalone cluster (`spark-master`/`spark-worker`, replacing Hadoop YARN) | [x] |
 | Kafka (KRaft) + Kafka UI + rider-event producer | [ ] |
 | Streaming consumer scaffolding with checkpointing | [ ] |
-| `OPTIMIZE`/`VACUUM` + time-travel query | [ ] |
+| `OPTIMIZE`/`ZORDER`/`VACUUM` (orders Silver, `dags/maintain_orders_silver.py`) | [x] |
+| Time-travel query | [ ] |
 
 ## Demo-day deliverables (definition of done)
 
@@ -91,7 +93,9 @@ test it, be able to explain it.
   change that boundary for a specific piece of work. **Exception on record:**
   the "Orders → Bronze" row above was built by Claude Code — the engineer
   explicitly opted to change the boundary for that one piece of work when
-  asked (see 2026-08-30 session log entry). Not a standing precedent for the
+  asked (see 2026-08-30 session log entry). **Second exception, same
+  pattern:** the "Orders → Silver" row was also built by Claude Code (see
+  the 2026-09-07 session log entry). Neither is a standing precedent for the
   rest of this table; each future row still defaults to closed unless asked
   again.
 - Infra/demo rows: `coder` may check these off after finishing full-delegate
@@ -101,6 +105,33 @@ test it, be able to explain it.
 
 Newest first. One or two lines: what happened, what you decided, what's next.
 
+- **2026-09-07 — built and verified the Silver orders layer:**
+  `dags/ingest_orders_silver.py` (Bronze→Silver MERGE, Asset-scheduled off
+  `ORDERS_BRONZE_ASSET`) and `dags/maintain_orders_silver.py`
+  (`OPTIMIZE`+`ZORDER`+`VACUUM`, `30 6 * * *`), backed by
+  `application/orders_silver_dedup.py`, `application/orders_silver_ingestion.py`,
+  `infrastructure/delta_silver_merge_writer.py`,
+  `metadata/orders_silver_schema.py`. One row per `order_id`, hybrid
+  sticky/latest-wins MERGE, partitioned by `created_date` only with a
+  batch-bounded `[min, max]` predicate injected into the MERGE condition
+  (load-bearing at the 5,000,000-orders/day design target — see
+  `docs/ADR.md`'s new appendix for the full reasoning and every rejected
+  alternative). Also fixed in the same changeset: a Bronze partition-spec
+  bug (manual vs. Asset-triggered runs disagreed on `[_extract_date,
+  _ingestion_window]`) and a rename of Bronze's `_ingested_at` lineage
+  column to `_bronze_ingested_at` (required a Bronze bucket wipe + re-ingest
+  rather than `ALTER TABLE RENAME COLUMN`, to avoid a one-way
+  `columnMapping` protocol upgrade — see ADR). 162 tests passed / 2
+  pre-existing failures (unrelated), host/container parity confirmed.
+- Explicitly deferred, not fixed here (see ADR appendix for the full list):
+  status-regression detection (latest-wins currently applies silently when
+  Bronze offers an earlier status with a newer `updated_at` — in tension
+  with `CLAUDE.md`'s "never quietly pick a side"), and two pre-existing
+  quarantine bugs in `application/bronze_ingestion.py`
+  (`split_clean_and_corrupt_rows()` misses extra-column rows; `_source_file`
+  gets corrupt-record content instead of a file path in the fulfillment
+  path) — flagged as the next work item, since a malformed row now becomes
+  persistent Silver state instead of a one-off bad row in a day's extract.
 - **2026-08-31 — switched `ingest_orders_bronze` from a daily cron to
   Asset-based (event-driven) scheduling.** `generate_orders` now lands one
   window-file per 5-minute run at `orders/date=<date>/orders_<run_timestamp>.csv`
@@ -135,7 +166,7 @@ Newest first. One or two lines: what happened, what you decided, what's next.
   with `metadata.orders_schema.OrdersSchema.RAW` applied explicitly (no
   `inferSchema`, `mode=FAILFAST` so a row that doesn't match fails the task
   loudly instead of landing corrupted), tags each row with `_extract_date`/
-  `_ingested_at`/`_source_file` (via `input_file_name()`, genuine lineage
+  `_bronze_ingested_at`/`_source_file` (via `input_file_name()`, genuine lineage
   back to the exact raw object read) and writes to
   `s3a://bronze-veloz/orders/`. Deliberately append-only *across* extract
   dates (an order's state can legitimately reappear across days as it

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/Users/danildazamacias/Documents/proyectos/Veloz/veloz-platform/.venv/bin/pip show *)"
+    ]
+  }
+}

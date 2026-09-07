@@ -339,3 +339,247 @@ Airflow containers rather than a bespoke Hadoop image). Reasoning:
   (including the YARN cluster this replaces, which never turned on Kerberos/
   YARN ACLs either) — the engineer should confirm this is the intended
   posture rather than an oversight.
+
+## Appendix — Silver orders layer (2026-09-07)
+
+Built and verified this session: `application/orders_silver_dedup.py`,
+`application/orders_silver_ingestion.py`,
+`infrastructure/delta_silver_merge_writer.py`,
+`metadata/orders_silver_schema.py`, `dags/ingest_orders_silver.py`, and
+`dags/maintain_orders_silver.py` — Silver's first table — plus a Bronze
+lineage-column rename and a Bronze partition-spec bug fix that surfaced
+while building it. 162 tests passed, 2 pre-existing failures unrelated to
+this work, host/container parity confirmed. The subsections below record
+the decisions worth defending, not a restatement of the code.
+
+### Grain: accumulating snapshot, not latest-row-wins
+
+Silver's grain is one row per `order_id`, reflecting the order's current
+lifecycle state — not one row per extract. Getting there is a two-level
+column-wise accumulation, not `row_number() == 1`: `application.
+orders_silver_dedup.collapse_bronze_batch` first collapses whatever
+Bronze rows a bounded read pulled in (a `last(..., ignorenulls=True)`
+over a whole-batch window, oldest-to-newest) down to one row per
+`order_id`, then `infrastructure.delta_silver_merge_writer` MERGEs that
+collapsed batch against everything already in Silver, per column. An
+order's lifecycle (`created → assigned → picked_up →
+delivered`/`cancelled`) spans many 5-minute Bronze ingestion windows, and
+the common Silver read is scoped to only a handful of those windows (see
+"Scheduling" below) — a plain `row_number() == 1` dedup applied to that
+slice would keep only the orders that happened to change in that window,
+overwriting Silver with a table of *recent activity*, not a table of
+*every order's current state*. The two-level design — collapse whatever's
+in the batch, then MERGE that against the full accumulated history — is
+what lets a bounded, incremental read still converge on a complete table.
+
+### Merge semantics: sticky vs. latest-wins columns
+
+Two column behaviors, both defined once in `metadata.orders_silver_schema`
+and shared by the collapse and the MERGE so they can't drift apart.
+Sticky columns (`created_at`, `assigned_at`, `picked_up_at`,
+`delivered_at`, `cancelled_at`) are always coalesced — a newer batch's
+value wins when present, but falls back to the existing value when the
+newer batch's own value is null — so a late-arriving or replayed window
+can still fill a gap in Silver instead of being discarded, but can never
+regress an already-set value back to null. Latest-wins columns (`status`,
+`rider_id`, `store_id`, `order_total`, `updated_at`) are only overwritten
+when `source.updated_at > target.updated_at`, no fallback.
+
+This directly serves G3: Bronze's own 30-minute lookback (`LOOKBACK_
+WINDOW_COUNT`) means the same order can legitimately show up in more than
+one Asset-triggered Silver run, and a batch that happens to carry an
+older `updated_at` than what Silver already holds still has evidence
+worth keeping for its sticky columns. The rejected alternative is a
+single strict `updated_at` guard applied uniformly to every column —
+simpler (one comparison, one branch, no coalesce), but it would silently
+drop an older batch's gap-filling value along with its stale ones, which
+is exactly the failure mode G3 exists to prevent.
+
+**Accepted limitation, stated plainly:** coalescing means a sticky column
+can never be reset to `NULL` once set. If an upstream system corrects a
+wrong `delivered_at` by nulling it out (rather than replacing it with a
+different timestamp), Silver has no mechanism to observe that correction
+— `coalesce(source, target)` just keeps the stale value. This is a real
+gap, not an oversight left unrecorded.
+
+### Incremental filter key: `_ingestion_window`, not `_bronze_ingested_at`
+
+`dags.ingest_orders_silver` filters its bounded Bronze read on
+`_ingestion_window`, never on `_bronze_ingested_at`. Bronze writes via
+Delta's `overwrite` + `replaceWhere` over a 30-minute lookback
+(`LOOKBACK_WINDOW_COUNT = 6` windows), which means the same row can be
+physically rewritten by Bronze up to 6 times across separate
+Asset-triggered runs — and each rewrite stamps a fresh
+`_bronze_ingested_at` (`current_timestamp()` at write time). Filtering an
+incremental Silver read on that column would be non-deterministic across
+reruns: which rows fall inside a given bounded read would depend on
+exactly when Bronze last happened to touch them, not on any property of
+the order data itself. `_ingestion_window` is derived from the raw
+window-file's own name (`WINDOW_PATTERN`), is stable across every Bronze
+rewrite, and is a Delta partition column, so filtering on it also prunes
+at read time instead of scanning.
+
+`_bronze_ingested_at` is retained on Silver (`BRONZE_LINEAGE_COLUMNS`) as
+an audit-only column — "who last touched this row and when" — never as a
+filter key. Worth recording: this is the same column renamed from
+`_ingested_at` to `_bronze_ingested_at` this session, applied universally
+across every Bronze source via `add_lineage_columns()` (orders,
+fulfillment, rider_events all pick up the new name), not an orders-only
+change.
+
+### Partitioning: `created_date` only, `ZORDER BY (order_id, store_id)`
+
+Silver is partitioned by `created_date` alone. Not `store_id`: the MERGE
+key is `order_id`, so Delta cannot prune target files on `store_id`
+during the match regardless of whether it's a partition column — adding
+it would double the partition tree (`created_date` × `store_id`) and
+multiply small-file count under a per-batch MERGE write pattern, for zero
+merge-time benefit. `ZORDER BY (order_id, store_id)` gives Ops' per-store
+query locality (G1) as a physical clustering instead, without paying that
+partitioning cost. Not `_extract_date`/`_ingestion_window` either: both
+are properties of *when* a row was ingested, not of the order itself —
+the same `order_id` shows up under a different date/window on every
+extract as it progresses through its lifecycle, so partitioning on either
+would make a row physically migrate across partitions on every MERGE,
+which Delta does not do safely. `created_date` must be a `DATE`, not a
+timestamp — a partition column carrying time-of-day cardinality would
+fragment the partition space for no benefit.
+
+The real performance lever isn't the partitioning scheme itself: it's
+`min`/`max(created_date)`, computed from the incoming batch at write
+time, injected as `target.created_date BETWEEN <min> AND <max>` into the
+MERGE condition alongside the `order_id` equality. This predicate is
+load-bearing, not cosmetic — without it, every MERGE full-scans the
+entire Silver table looking for each batch's `order_id` matches, and at
+the 5,000,000-orders/day design target that's a full-table scan on every
+one of the dozens of Asset-triggered MERGEs Silver runs per day. Its
+correctness is coupled to an unenforced invariant: `created_at` never
+changes for a given `order_id` once set (it's a `STICKY_COLUMNS` entry,
+and `created_date` is deliberately excluded from the MERGE's `whenMatched
+Update` set, so a matched row's stored `created_date` is never touched
+after insert). If that invariant were ever violated, a later batch's own
+`[min, max]` bound — computed from that batch's rows alone — could
+exclude the target's actual stored `created_date`, missing the match and
+silently inserting a duplicate `order_id` row via `whenNotMatchedInsert`
+instead of updating the existing one. Now covered by a regression test
+(`tests/test_delta_silver_merge_writer.py::TestCreatedDateStability`), not
+left as an assumption.
+
+### Scheduling: asset-driven Bronze → Silver
+
+`dags.ingest_orders_bronze` declares `outlets=[ORDERS_BRONZE_ASSET]` on
+its `run()` task and publishes `outlet_events[ORDERS_BRONZE_ASSET].extra
+= {"extract_dates": [...], "windows": [...]}` — exactly what that run
+actually wrote, not what it intended to write. `dags.ingest_orders_silver`
+schedules off `schedule=[ORDERS_BRONZE_ASSET]`. A critical detail worth
+recording on its own: with `max_active_runs=1`, Airflow coalesces every
+`ORDERS_BRONZE_ASSET` event that arrives while a Silver run is already in
+progress onto the *next* run, so `context["triggering_asset_events"]` can
+carry more than one event at a time. Silver's `_union_bronze_asset_event_
+extras` unions `extract_dates`/`windows` across every one of them, rather
+than reading only the most recent — reading only the latest would
+silently drop whatever the coalesced-away events described, an order
+window that landed in Bronze but would never reach Silver.
+
+Manual-rerun precedence (`_resolve_ingestion_filter`): an explicit
+`params["mode"]` (`ingestion_window` or `extract_date`) always wins over
+whatever triggered the run; absent that, the union of triggering asset
+event extras; absent that, raise. Never a silent "today" or "everything"
+default — a Silver MERGE processing the wrong slice unnoticed is judged
+worse than a task failing loudly.
+
+`ORDERS_BRONZE_ASSET` (a plain producer/consumer `Asset`, no watcher of
+its own) is deliberately a different mechanism from `ORDERS_RAW_ASSET`
+(`S3NewObjectTrigger` + `AssetWatcher` polling MinIO for new raw files).
+One is a custom-triggered consumer of an external raw feed; the other is
+a plain outlet event announcing what a task inside this pipeline already
+wrote. Conflating them would couple Silver's schedule to raw-file
+polling it has no reason to depend on directly.
+
+### Bronze partition-spec fix
+
+A real bug, not a hypothetical: manual (no-Asset-event) runs of
+`ingest_orders_bronze` previously wrote Bronze with partition spec
+`[_extract_date]` only (`window_column=None`), while Asset-triggered runs
+wrote `[_extract_date, _ingestion_window]`. A Delta table's partition
+spec is fixed at creation and cannot be changed by a later write, so
+whichever run mode happened to create the table first locked in that
+layout — and the *other* mode's next run would fail outright on a
+partition-spec mismatch. Fixed via `_resolve_window_spec`: every run mode
+now declares the same `[_extract_date, _ingestion_window]` spec
+unconditionally; only the `replaceWhere` overwrite *scope* differs by
+mode — a bounded window set for an Asset-triggered run, `None` (the whole
+`_extract_date` partition) for a manual run's full-day glob.
+
+Worth recording precisely: the live `bronze-veloz/orders` and
+`bronze-veloz/rider_events` tables were checked directly and already
+carried the correct `[_extract_date, _ingestion_window]` spec — the
+Asset-triggered path happened to create both tables first in practice, so
+the bug hadn't yet manifested against real data. Fixed proactively before
+a manual rerun could hit it, not reactively after one did.
+
+### Bronze bucket wipe for the lineage-column rename
+
+`_ingested_at` → `_bronze_ingested_at` is a schema change on Delta tables
+that already existed with data in them (`bronze-veloz/orders`,
+`/rider_events`, `/fulfillment`). Rejected: `ALTER TABLE ... RENAME
+COLUMN`, which requires enabling `delta.columnMapping.mode` — a one-way
+protocol upgrade with no downgrade path; once a table's protocol is
+bumped for column mapping, every reader and writer touching it needs a
+Delta client that understands the mapping, permanently. That's real,
+lasting debt to take on for what is, here, a purely cosmetic rename.
+Chosen instead: wipe the Bronze buckets and re-ingest from raw. Cheap
+specifically because the underlying data is synthetic and disposable, and
+`raw-incoming-data` (the actual source of truth for a re-ingest) is
+retained untouched throughout — nothing is lost by re-running Bronze
+ingestion from scratch.
+
+### Maintenance as a separate DAG
+
+`OPTIMIZE` + `ZORDER BY (order_id, store_id)` + `VACUUM` run in
+`dags.maintain_orders_silver`, scheduled `30 6 * * *` (06:30 UTC daily) —
+not as a task appended to `ingest_orders_silver`'s write path.
+`ingest_orders_silver`'s MERGE runs dozens of times a day straight off
+`ORDERS_BRONZE_ASSET` events and has to stay fast per batch; bolting a
+full-table `OPTIMIZE`/`VACUUM` onto every one of those runs would make
+every Bronze-triggered MERGE pay a full-table-scan cost it has no need
+for, just to keep the table compacted for a read pattern that happens on
+its own, independent cadence. 06:30 UTC is off-peak across all three
+markets (Medellín/Bogotá at UTC-5, São Paulo at UTC-3) and comfortably
+ahead of Finance's 8am-local reconciliation deadline (G2) in every one of
+them — São Paulo's is the tightest, 11:00 UTC, 4.5 hours after this DAG
+starts — so the ZORDERed layout is already in place before that morning's
+heaviest read pattern instead of competing with it. VACUUM retention is
+kept at Delta's own default, 168 hours (7 days), rather than shortened:
+long enough to cover an in-flight time-travel query without disabling
+Delta's `retentionDurationCheck` safety guard, and G2's "what did
+yesterday's numbers look like" beyond that window is already served by
+Bronze's own untouched, append-only retention — this table doesn't need a
+longer retention to satisfy that requirement on its own.
+
+### Explicitly deferred
+
+Recorded as deliberate deferrals, not oversights:
+
+- **Status-regression detection/quarantine.** When Bronze offers an
+  earlier lifecycle status with a *newer* `updated_at` than what Silver
+  already holds, that's upstream corruption — a status cannot legitimately
+  move backward. Latest-wins currently applies it silently, indistinguishable
+  from any other latest-wins update. This is in direct tension with
+  `CLAUDE.md`'s "when two sources disagree, show the disagreement — never
+  quietly pick a side": latest-wins is quietly picking the newer batch's
+  side. Worth revisiting before Silver is relied on for anything
+  Ops-facing.
+- **A third Silver filter mode keyed on `_bronze_ingested_at`** was
+  considered and rejected for the same non-determinism reason as the
+  "Incremental filter key" decision above — not built at all, not even as
+  an unused code path.
+- **Two pre-existing quarantine bugs, found but not introduced by this
+  work** (`application/bronze_ingestion.py`): `split_clean_and_corrupt_
+  rows()` fails to mark rows with extra columns as corrupt, and
+  `_source_file` receives corrupt-record content instead of the source
+  file path in the fulfillment ingestion path. Impact: a malformed row can
+  currently enter Bronze marked clean, and with the new Silver MERGE now
+  in place, that bad row becomes persistent order state instead of a
+  one-off defect in a single day's extract. Recorded as the recommended
+  next work item, ahead of relying on Silver for anything Finance-facing.

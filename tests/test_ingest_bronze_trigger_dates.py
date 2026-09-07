@@ -16,6 +16,13 @@ bounded reglob (see each module's docstring): the former groups a
 triggering run's window tokens by date, the latter expands a run's
 triggering windows into the bounded lookback of already-landed windows
 each run's Bronze write actually needs to cover.
+
+Also covers `_resolve_window_spec`, the pure function behind each DAG's
+uniform `[_extract_date, _ingestion_window]` partition spec across every
+run mode (regression coverage for the bug where a manual/full-day run
+used to opt out of the `_ingestion_window` sub-partition entirely, which
+would lock a Delta table created by one run mode into a spec the other
+mode's requests couldn't satisfy).
 """
 
 from __future__ import annotations
@@ -252,3 +259,46 @@ class TestResolveWindowsToIngest:
 
         with pytest.raises(ValueError):
             fn(all_windows, ["20260905T999999Z"], lookback_count=6)
+
+
+def _load_resolve_window_spec_fn(load_dag_pure_symbols, dag_filename: str):
+    namespace = load_dag_pure_symbols(
+        dag_filename, {"INGESTION_WINDOW_COLUMN", "_resolve_window_spec"}, {"re": re}
+    )
+    return namespace["_resolve_window_spec"], namespace["INGESTION_WINDOW_COLUMN"]
+
+
+@pytest.mark.parametrize("dag_filename", DAG_FILENAMES)
+class TestResolveWindowSpec:
+    """Regression coverage for R1: every run mode must request the same partition spec.
+
+    A Delta table has one fixed partition spec; a manual/full-day run that
+    opted out of `_ingestion_window` (passing `window_column=None`) would
+    produce a different spec than an Asset-triggered run, and whichever
+    mode ran first would lock the table into a spec the other mode's
+    request couldn't satisfy. `_resolve_window_spec` is what both `run()`
+    branches now go through to avoid that split.
+    """
+
+    def test_manual_mode_sets_window_column_with_none_values(
+        self, load_dag_pure_symbols, dag_filename: str
+    ) -> None:
+        """No triggering windows (manual/full-day run): window_column is still set, window_values is None."""
+        fn, ingestion_window_column = _load_resolve_window_spec_fn(load_dag_pure_symbols, dag_filename)
+
+        window_column, window_values = fn([], ["20260905T000000Z", "20260905T000500Z"])
+
+        assert window_column == ingestion_window_column
+        assert window_values is None
+
+    def test_triggered_mode_sets_window_column_with_windows_read(
+        self, load_dag_pure_symbols, dag_filename: str
+    ) -> None:
+        """Non-empty triggering windows (Asset-triggered run): window_values carries the bounded windows read."""
+        fn, ingestion_window_column = _load_resolve_window_spec_fn(load_dag_pure_symbols, dag_filename)
+        windows_read = ["20260905T000000Z", "20260905T000500Z"]
+
+        window_column, window_values = fn(["20260905T000500Z"], windows_read)
+
+        assert window_column == ingestion_window_column
+        assert window_values == windows_read
