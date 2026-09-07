@@ -42,6 +42,20 @@ class _FakeAssetEvent:
         self.extra = extra
 
 
+def _trigger_extra(bucket: str, key: str) -> dict:
+    """Builds an `AssetEvent.extra` payload shaped like Airflow's own `Trigger.submit_event`.
+
+    `Trigger.submit_event` (`airflow/models/trigger.py`) wraps a
+    trigger's `TriggerEvent` payload before storing it on the resulting
+    `AssetEvent`, nesting it under `extra["payload"]` alongside
+    `extra["from_trigger"]` rather than storing it as `extra` directly.
+    `S3NewObjectTrigger` yields `TriggerEvent({"bucket": ..., "key":
+    ...})`, so a real triggered event's `extra` looks like this, not
+    like a flat `{"bucket": ..., "key": ...}`.
+    """
+    return {"from_trigger": True, "payload": {"bucket": bucket, "key": key}}
+
+
 def _load_extract_dates_fn(load_dag_pure_symbols, dag_filename: str):
     namespace = load_dag_pure_symbols(
         dag_filename,
@@ -63,8 +77,8 @@ class TestExtractDatesFromTriggeringEvent:
         context = {
             "triggering_asset_events": {
                 "some-asset": [
-                    _FakeAssetEvent({"bucket": "raw-incoming-data", "key": "orders/date=2026-09-04/orders_2350.csv"}),
-                    _FakeAssetEvent({"bucket": "raw-incoming-data", "key": "orders/date=2026-09-05/orders_0005.csv"}),
+                    _FakeAssetEvent(_trigger_extra("raw-incoming-data", "orders/date=2026-09-04/orders_2350.csv")),
+                    _FakeAssetEvent(_trigger_extra("raw-incoming-data", "orders/date=2026-09-05/orders_0005.csv")),
                 ]
             }
         }
@@ -77,8 +91,8 @@ class TestExtractDatesFromTriggeringEvent:
         context = {
             "triggering_asset_events": {
                 "some-asset": [
-                    _FakeAssetEvent({"bucket": "raw-incoming-data", "key": "orders/date=2026-09-05/orders_0000.csv"}),
-                    _FakeAssetEvent({"bucket": "raw-incoming-data", "key": "orders/date=2026-09-05/orders_0005.csv"}),
+                    _FakeAssetEvent(_trigger_extra("raw-incoming-data", "orders/date=2026-09-05/orders_0000.csv")),
+                    _FakeAssetEvent(_trigger_extra("raw-incoming-data", "orders/date=2026-09-05/orders_0005.csv")),
                 ]
             }
         }
@@ -97,7 +111,7 @@ class TestExtractDatesFromTriggeringEvent:
         fn = _load_extract_dates_fn(load_dag_pure_symbols, dag_filename)
         context = {
             "triggering_asset_events": {
-                "some-asset": [_FakeAssetEvent({"bucket": "raw-incoming-data", "key": "orders/malformed-key.csv"})]
+                "some-asset": [_FakeAssetEvent(_trigger_extra("raw-incoming-data", "orders/malformed-key.csv"))]
             }
         }
 
@@ -128,7 +142,7 @@ class TestWindowsFromTriggeringEvent:
         key = WINDOW_KEY_TEMPLATES[dag_filename].format(date="2026-09-05", window="20260905T191000Z")
         context = {
             "triggering_asset_events": {
-                "some-asset": [_FakeAssetEvent({"bucket": "raw-incoming-data", "key": key})]
+                "some-asset": [_FakeAssetEvent(_trigger_extra("raw-incoming-data", key))]
             }
         }
 
@@ -144,10 +158,14 @@ class TestWindowsFromTriggeringEvent:
             "triggering_asset_events": {
                 "some-asset": [
                     _FakeAssetEvent(
-                        {"bucket": "raw-incoming-data", "key": template.format(date="2026-09-05", window="20260905T191500Z")}
+                        _trigger_extra(
+                            "raw-incoming-data", template.format(date="2026-09-05", window="20260905T191500Z")
+                        )
                     ),
                     _FakeAssetEvent(
-                        {"bucket": "raw-incoming-data", "key": template.format(date="2026-09-05", window="20260905T191000Z")}
+                        _trigger_extra(
+                            "raw-incoming-data", template.format(date="2026-09-05", window="20260905T191000Z")
+                        )
                     ),
                 ]
             }
@@ -163,10 +181,14 @@ class TestWindowsFromTriggeringEvent:
             "triggering_asset_events": {
                 "some-asset": [
                     _FakeAssetEvent(
-                        {"bucket": "raw-incoming-data", "key": template.format(date="2026-09-04", window="20260904T235500Z")}
+                        _trigger_extra(
+                            "raw-incoming-data", template.format(date="2026-09-04", window="20260904T235500Z")
+                        )
                     ),
                     _FakeAssetEvent(
-                        {"bucket": "raw-incoming-data", "key": template.format(date="2026-09-05", window="20260905T000000Z")}
+                        _trigger_extra(
+                            "raw-incoming-data", template.format(date="2026-09-05", window="20260905T000000Z")
+                        )
                     ),
                 ]
             }

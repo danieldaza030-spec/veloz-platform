@@ -108,10 +108,14 @@ def _extract_dates_from_triggering_event(context: dict) -> list[str]:
     """Pulls every distinct `date=<date>` segment out of the Asset events that triggered this run.
 
     `context["triggering_asset_events"]` maps each `Asset` to the list of
-    `AssetEvent`s that caused this run; `S3NewObjectTrigger` sets each
-    event's `extra` to `{"bucket": ..., "key": ...}` (see that module's
-    `TriggerEvent` payload), so each new object's key is read back off of
-    it here. Plural because `max_active_runs=1` means a run still in
+    `AssetEvent`s that caused this run. `S3NewObjectTrigger` yields a
+    `TriggerEvent({"bucket": ..., "key": ...})`, but Airflow's own
+    `Trigger.submit_event` (see `airflow/models/trigger.py`) wraps that
+    payload before storing it on the `AssetEvent`, so each event's `extra`
+    actually looks like `{"from_trigger": True, "payload": {"bucket": ...,
+    "key": ...}}` — the new object's key is read back off the nested
+    `payload` dict here, not off `extra` directly. Plural because
+    `max_active_runs=1` means a run still in
     progress makes Airflow coalesce every Asset event that arrives
     meanwhile onto the next run: if those coalesced events span more than
     one `date=` partition (e.g. some land just before midnight, some just
@@ -124,7 +128,8 @@ def _extract_dates_from_triggering_event(context: dict) -> list[str]:
     dates: set[str] = set()
     for events in triggering_events.values():
         for event in events:
-            match = DATE_PARTITION_PATTERN.search((event.extra or {}).get("key", ""))
+            key = ((event.extra or {}).get("payload") or {}).get("key", "")
+            match = DATE_PARTITION_PATTERN.search(key)
             if match:
                 dates.add(match.group(1))
     return sorted(dates)
@@ -151,7 +156,7 @@ def _windows_from_triggering_event(context: dict) -> dict[str, list[str]]:
     windows_by_date: dict[str, set[str]] = {}
     for events in triggering_events.values():
         for event in events:
-            key = (event.extra or {}).get("key", "")
+            key = ((event.extra or {}).get("payload") or {}).get("key", "")
             date_match = DATE_PARTITION_PATTERN.search(key)
             window_match = WINDOW_PATTERN.search(key)
             if date_match and window_match:
