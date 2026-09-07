@@ -14,6 +14,26 @@ from dataclasses import dataclass
 from pyspark.sql import DataFrame
 
 
+def _validate_no_single_quote(value: str, field_name: str) -> None:
+    """Raises if `value` contains a single-quote character.
+
+    A `replaceWhere` predicate is built by string interpolation, so a
+    single quote in a value would break out of the quoted literal and
+    produce a malformed (or injectable) predicate.
+
+    Args:
+        value: Value about to be interpolated into a `replaceWhere`
+            predicate.
+        field_name: Name of the field `value` came from, used in the
+            error message so a caller can tell which value was rejected.
+
+    Raises:
+        ValueError: If `value` contains a single-quote character.
+    """
+    if "'" in value:
+        raise ValueError(f"{field_name} must not contain a single quote: {value!r}")
+
+
 @dataclass(frozen=True)
 class DeltaBronzeWriter:
     """Writes a DataFrame into a Bronze Delta table idempotently.
@@ -32,32 +52,54 @@ class DeltaBronzeWriter:
         df: DataFrame,
         partition_column: str,
         partition_value: str,
+        window_column: str | None = None,
+        window_values: list[str] | None = None,
     ) -> None:
-        """Overwrites one partition of the Bronze Delta table.
+        """Overwrites one partition (optionally, one set of windows within it) of the Bronze Delta table.
 
-        Only rows matching `partition_column = partition_value` are
-        replaced; every other existing partition is left untouched. This
-        makes re-running the same load for the same partition value safe
-        by construction, rather than relying on the caller to deduplicate.
+        Only rows matching `partition_column = partition_value` (and, when
+        `window_column`/`window_values` are given, also
+        `window_column IN (...)`) are replaced; every other existing
+        partition/window is left untouched. This makes re-running the same
+        load for the same partition value (and, for a sub-partitioned
+        table, the same bounded set of windows) safe by construction,
+        rather than relying on the caller to deduplicate.
 
         Args:
-            df: Rows to write. Must include `partition_column`.
+            df: Rows to write. Must include `partition_column` (and
+                `window_column`, when given).
             partition_column: Column identifying the partition being
                 replaced, e.g. `_extract_date`.
             partition_value: Value of `partition_column` for this load,
                 e.g. `2026-08-30`. Quoted into the `replaceWhere` predicate.
+            window_column: Name of a finer-grained sub-partition column
+                to additionally scope the overwrite to, e.g.
+                `_ingestion_window`. Must be set together with
+                `window_values`, or left `None` for the current
+                single-partition behavior.
+            window_values: Values of `window_column` to include in the
+                overwrite scope. Must be set together with
+                `window_column`, or left `None`.
 
         Raises:
-            ValueError: If `partition_value` contains a single-quote
-                 character, which would break out of the quoted literal
-                and produce a malformed `replaceWhere` predicate.
+            ValueError: If `partition_value` or any `window_values`
+                element contains a single-quote character, which would
+                break out of the quoted literal and produce a malformed
+                `replaceWhere` predicate. Also raised if exactly one of
+                `window_column`/`window_values` is set.
         """
-        if "'" in partition_value:
-            raise ValueError(
-                f"partition_value must not contain a single quote: "
-                f"{partition_value!r}"
-            )
+        if (window_column is None) != (window_values is None):
+            raise ValueError("window_column and window_values must both be set or both be None")
+
+        _validate_no_single_quote(partition_value, "partition_value")
         replace_where = f"{partition_column} = '{partition_value}'"
+
+        if window_column is not None and window_values is not None:
+            for window_value in window_values:
+                _validate_no_single_quote(window_value, "window_values")
+            quoted_values = ", ".join(f"'{value}'" for value in window_values)
+            replace_where = f"{replace_where} AND {window_column} IN ({quoted_values})"
+
         writer = (
             df.write.format("delta")
             .mode("overwrite")

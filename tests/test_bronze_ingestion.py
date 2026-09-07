@@ -176,6 +176,157 @@ class TestIngestToBronze:
         assert result.count() == 2
 
 
+class TestAddLineageColumnsWindow:
+    """Test the optional `_ingestion_window` derivation in add_lineage_columns."""
+
+    def test_derives_window_token_from_source_file(
+        self, spark_session: SparkSession, temp_delta_path: str
+    ) -> None:
+        """Verify the run-timestamp token is extracted from a realistic `_source_file` path."""
+        csv_dir = Path(temp_delta_path) / "raw"
+        csv_dir.mkdir()
+        csv_path = csv_dir / "orders_20260905T191000Z.csv"
+        csv_path.write_text("order_id,store_id,value\norder_1,store_1,100\n")
+
+        schema = StructType(
+            [
+                StructField("order_id", StringType(), False),
+                StructField("store_id", StringType(), False),
+                StructField("value", StringType(), False),
+            ]
+        )
+
+        raw_df = (
+            spark_session.read.format("csv")
+            .schema(schema)
+            .option("header", "true")
+            .load(str(csv_path))
+        )
+
+        tagged = add_lineage_columns(
+            raw_df,
+            extract_date="2026-09-05",
+            partition_column="_extract_date",
+            window_column="_ingestion_window",
+        )
+
+        assert "_ingestion_window" in tagged.columns
+        row = tagged.collect()[0]
+        assert row["_ingestion_window"] == "20260905T191000Z"
+
+    def test_omits_window_column_when_not_requested(
+        self, spark_session: SparkSession, temp_delta_path: str
+    ) -> None:
+        """Verify no window column is added when window_column is left None (default)."""
+        csv_dir = Path(temp_delta_path) / "raw"
+        csv_dir.mkdir()
+        csv_path = csv_dir / "orders_20260905T191000Z.csv"
+        csv_path.write_text("order_id,value\norder_1,100\n")
+
+        schema = StructType(
+            [
+                StructField("order_id", StringType(), False),
+                StructField("value", StringType(), False),
+            ]
+        )
+
+        raw_df = (
+            spark_session.read.format("csv")
+            .schema(schema)
+            .option("header", "true")
+            .load(str(csv_path))
+        )
+
+        tagged = add_lineage_columns(raw_df, extract_date="2026-09-05", partition_column="_extract_date")
+
+        assert "_ingestion_window" not in tagged.columns
+
+
+class TestIngestToBronzeWithWindow:
+    """Test ingest_to_bronze's window sub-partitioning, opted into via BronzeIngestionRequest."""
+
+    def _write_orders_csv(self, path: Path, order_id: str, value: str) -> None:
+        path.write_text(f"order_id,store_id,value\n{order_id},store_1,{value}\n")
+
+    def test_writes_and_replaces_only_the_targeted_window(
+        self, spark_session: SparkSession, temp_delta_path: str
+    ) -> None:
+        """Verify both the extract-date and ingestion-window columns are physically partitioned on, and only the targeted window is replaced."""
+        csv_dir = Path(temp_delta_path) / "raw"
+        csv_dir.mkdir()
+
+        first_csv = csv_dir / "orders_20260905T000000Z.csv"
+        self._write_orders_csv(first_csv, "order_1", "100")
+        second_csv = csv_dir / "orders_20260905T000500Z.csv"
+        self._write_orders_csv(second_csv, "order_2", "200")
+
+        schema = StructType(
+            [
+                StructField("order_id", StringType(), False),
+                StructField("store_id", StringType(), False),
+                StructField("value", StringType(), False),
+            ]
+        )
+
+        bronze_path = str(Path(temp_delta_path) / "bronze")
+
+        request = BronzeIngestionRequest(
+            raw_path=[str(first_csv), str(second_csv)],
+            raw_format="csv",
+            schema=schema,
+            read_options={"header": "true", "mode": "FAILFAST"},
+            bronze_path=bronze_path,
+            partition_column="_extract_date",
+            extract_date="2026-09-05",
+            window_column="_ingestion_window",
+            window_values=["20260905T000000Z", "20260905T000500Z"],
+        )
+
+        row_count = ingest_to_bronze(spark_session, request)
+        assert row_count == 2
+
+        result = spark_session.read.format("delta").load(bronze_path)
+        assert result.count() == 2
+        assert "_ingestion_window" in result.columns
+
+        # Physical partitioning: both partition columns should show up as
+        # directories in the Delta table's file layout, not just as a
+        # regular data column.
+        partition_dirs = {p.name for p in Path(bronze_path).glob("_extract_date=*")}
+        assert partition_dirs, "expected _extract_date=... partition directories"
+        window_dirs = {
+            p.name for extract_dir in Path(bronze_path).glob("_extract_date=*") for p in extract_dir.glob("_ingestion_window=*")
+        }
+        assert window_dirs == {"_ingestion_window=20260905T000000Z", "_ingestion_window=20260905T000500Z"}
+
+        # Re-ingest only the second window with a changed row (overwriting
+        # the same window-carrying filename in place, so add_lineage_columns
+        # re-derives the same "_ingestion_window" value), and confirm the
+        # first window's row survives untouched.
+        self._write_orders_csv(second_csv, "order_2", "999")
+
+        replacement_request = BronzeIngestionRequest(
+            raw_path=str(second_csv),
+            raw_format="csv",
+            schema=schema,
+            read_options={"header": "true", "mode": "FAILFAST"},
+            bronze_path=bronze_path,
+            partition_column="_extract_date",
+            extract_date="2026-09-05",
+            window_column="_ingestion_window",
+            window_values=["20260905T000500Z"],
+        )
+
+        row_count_2 = ingest_to_bronze(spark_session, replacement_request)
+        assert row_count_2 == 1
+
+        result_2 = spark_session.read.format("delta").load(bronze_path)
+        rows_by_order = {row["order_id"]: row["value"] for row in result_2.collect()}
+        assert result_2.count() == 2
+        assert rows_by_order["order_1"] == "100"
+        assert rows_by_order["order_2"] == "999"
+
+
 class TestWithCorruptRecordColumn:
     """Test the PERMISSIVE-mode schema-extension helper."""
 

@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.functions import col, current_timestamp, input_file_name, lit
+from pyspark.sql.functions import col, current_timestamp, input_file_name, lit, regexp_extract
 from pyspark.sql.types import StringType, StructField, StructType
 
 from infrastructure.delta_bronze_writer import DeltaBronzeWriter
@@ -30,7 +30,10 @@ class BronzeIngestionRequest:
 
     Attributes:
         raw_path: Location of the raw file(s) to read, e.g.
-            `s3a://raw-incoming-data/orders/orders_2026-08-30.csv`.
+            `s3a://raw-incoming-data/orders/orders_2026-08-30.csv`. Also
+            accepts a list of file locations — Spark's `.load()` reads a
+            list of paths natively — for a caller that has resolved an
+            explicit, bounded set of window-files instead of a glob.
         raw_format: Spark data source format for the raw file, e.g.
             `"csv"`.
         schema: Explicit schema to apply while reading. Never inferred —
@@ -45,15 +48,25 @@ class BronzeIngestionRequest:
             `_extract_date`.
         extract_date: Value of `partition_column` for this load, in
             `YYYY-MM-DD` format.
+        window_column: Name of a finer-grained sub-partition column
+            derived from the ingested window-file's own name, e.g.
+            `_ingestion_window`. `None` (default) leaves the Bronze table
+            partitioned by `partition_column` alone.
+        window_values: Values of `window_column` covered by this load's
+            `raw_path`, used to scope the Bronze `replaceWhere` predicate
+            to only those windows. Must be set together with
+            `window_column`, or left `None`.
     """
 
-    raw_path: str
+    raw_path: str | list[str]
     raw_format: str
     schema: StructType
     read_options: dict[str, str]
     bronze_path: str
     partition_column: str
     extract_date: str
+    window_column: str | None = None
+    window_values: list[str] | None = None
 
 
 def add_lineage_columns(
@@ -62,6 +75,7 @@ def add_lineage_columns(
     partition_column: str,
     derive_partition_column: bool = True,
     derive_source_file: bool = True,
+    window_column: str | None = None,
 ) -> DataFrame:
     """Tags a raw DataFrame with ingestion lineage columns.
 
@@ -84,10 +98,17 @@ def add_lineage_columns(
             resolving correctly once a DataFrame has been materialized
             through a cache, so a caller that needs to cache `df` first
             (see `ingest_clean_rows_to_bronze`) must tag it beforehand.
+        window_column: If given, an ingestion-window sub-partition column
+            is derived from `_source_file`'s embedded run timestamp (the
+            `%Y%m%dT%H%M%SZ`-formatted token `generators/s3_io.py`'s
+            window-scoped generators put in each object's name, e.g.
+            `orders_20260905T191000Z.csv`) and added under this name.
+            `None` (default) skips this column entirely.
 
     Returns:
         `df` with `partition_column` (as a `date`, when derived),
-        `_ingested_at`, and `_source_file` (when derived) columns added.
+        `_ingested_at`, `_source_file` (when derived), and
+        `window_column` (when given) columns added.
     """
     tagged = df
     if derive_partition_column:
@@ -95,6 +116,11 @@ def add_lineage_columns(
     tagged = tagged.withColumn("_ingested_at", current_timestamp())
     if derive_source_file:
         tagged = tagged.withColumn("_source_file", input_file_name())
+    if window_column is not None:
+        tagged = tagged.withColumn(
+            window_column,
+            regexp_extract(col("_source_file"), r"_(\d{8}T\d{6}Z)\.", 1),
+        )
     return tagged
 
 
@@ -103,7 +129,7 @@ def _read_raw(
     raw_format: str,
     schema: StructType,
     read_options: dict[str, str],
-    raw_path: str,
+    raw_path: str | list[str],
 ) -> DataFrame:
     """Reads a raw file(s) with an explicit schema and reader options.
 
@@ -112,7 +138,9 @@ def _read_raw(
         raw_format: Spark data source format, e.g. `"csv"`.
         schema: Explicit schema to apply while reading.
         read_options: Extra `DataFrameReader` options.
-        raw_path: Location of the raw file(s) to read.
+        raw_path: Location of the raw file(s) to read. A list of
+            locations is read natively by Spark's `.load()`, no different
+            handling needed here.
 
     Returns:
         The raw file(s) as a DataFrame, with no lineage tagging applied.
@@ -139,18 +167,24 @@ def ingest_to_bronze(spark: SparkSession, request: BronzeIngestionRequest) -> in
     )
 
     bronze_df = add_lineage_columns(
-        raw_df, request.extract_date, request.partition_column
+        raw_df,
+        request.extract_date,
+        request.partition_column,
+        window_column=request.window_column,
     )
     row_count = bronze_df.count()
 
     writer = DeltaBronzeWriter(
         path=request.bronze_path,
-        partition_columns=[request.partition_column],
+        partition_columns=[request.partition_column]
+        + ([request.window_column] if request.window_column else []),
     )
     writer.write(
         bronze_df,
         partition_column=request.partition_column,
         partition_value=request.extract_date,
+        window_column=request.window_column,
+        window_values=request.window_values,
     )
 
     return row_count
