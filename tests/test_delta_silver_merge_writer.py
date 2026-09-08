@@ -585,3 +585,28 @@ class TestEmptyBatch:
         writer.write(_build_batch(spark_session, tmp_path, []))
 
         assert DeltaTable.isDeltaTable(spark_session, temp_delta_path) is False
+
+
+class TestPathNormalization:
+    """Test path normalization in __post_init__ to avoid DELTA_AMBIGUOUS_PATHS_IN_CREATE_TABLE."""
+
+    def test_trailing_slash_is_stripped_from_path(self) -> None:
+        """Verify a path with trailing slash(es) is normalized by __post_init__."""
+        writer = DeltaSilverMergeWriter(
+            path="s3a://silver-veloz/orders/", schema=OrdersSilverSchema.TARGET
+        )
+        assert writer.path == "s3a://silver-veloz/orders"
+
+    def test_multiple_trailing_slashes_are_stripped(self) -> None:
+        """Verify multiple trailing slashes are all removed."""
+        writer = DeltaSilverMergeWriter(
+            path="s3a://silver-veloz/orders///", schema=OrdersSilverSchema.TARGET
+        )
+        assert writer.path == "s3a://silver-veloz/orders"
+
+    def test_path_without_trailing_slash_is_unchanged(self) -> None:
+        """Verify a path without trailing slash is left as-is."""
+        writer = DeltaSilverMergeWriter(
+            path="s3a://silver-veloz/orders", schema=OrdersSilverSchema.TARGET
+        )
+        assert writer.path == "s3a://silver-veloz/orders"

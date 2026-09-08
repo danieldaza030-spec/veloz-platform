@@ -169,22 +169,55 @@ def build_insert_values(source_columns: list[str]) -> dict[str, Column]:
     return insert_values
 
 
+def _column_ddl(field) -> str:
+    """Renders one `StructField` as a backtick-quoted `CREATE TABLE` column clause."""
+    not_null = "" if field.nullable else " NOT NULL"
+    return f"`{field.name}` {field.dataType.simpleString()}{not_null}"
+
+
 def _ensure_table_exists(spark: SparkSession, path: str, schema: StructType) -> None:
     """Creates the Silver Delta table at `path` if it doesn't already exist.
 
+    Uses a raw `CREATE TABLE IF NOT EXISTS delta.\\`<path>\\`` SQL statement
+    instead of `DeltaTable.createIfNotExists(spark).location(path)`. The
+    fluent builder's `.location(path)` call goes through `DeltaCatalog`
+    (registered as `spark_catalog` in this platform's Spark config) and,
+    against the `s3a://` filesystem specifically, ends up comparing two
+    independently-derived representations of `path` -- the literal string
+    passed to `.location()`, and a second one `DeltaCatalog`
+    re-qualifies via `S3AFileSystem`, which appends a trailing slash when
+    it qualifies what it treats as a directory-like key. Those two
+    representations differing by exactly a trailing slash is what raises
+    `DELTA_AMBIGUOUS_PATHS_IN_CREATE_TABLE`, regardless of whether the
+    caller's own `path` already had a trailing slash stripped (see
+    `DeltaSilverMergeWriter.__post_init__`) -- local-filesystem unit tests
+    never exercise this because plain `Path` qualification on a local FS
+    doesn't add that trailing slash, so the fluent-builder version passed
+    in CI while failing every time against the real MinIO/s3a stack. A
+    path-based identifier (`delta.`<path>`` in the raw SQL) with no separate
+    `.location()`/`LOCATION` clause gives Delta only one representation of
+    `path` to work with, so there's nothing left to disagree with itself.
+
     Args:
         spark: Active SparkSession.
-        path: Delta table location, e.g. `s3a://silver-veloz/orders/`.
+        path: Delta table location, e.g. `s3a://silver-veloz/orders`.
         schema: Full target schema, `OrdersSilverSchema.TARGET`.
     """
     if DeltaTable.isDeltaTable(spark, path):
         return
 
-    builder = DeltaTable.createIfNotExists(spark).location(path).addColumns(schema)
-    builder = builder.partitionedBy(PARTITION_COLUMN)
-    for key, value in TABLE_PROPERTIES.items():
-        builder = builder.property(key, value)
-    builder.execute()
+    columns_ddl = ",\n            ".join(_column_ddl(field) for field in schema.fields)
+    properties_ddl = ", ".join(f"'{key}' = '{value}'" for key, value in TABLE_PROPERTIES.items())
+    spark.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS delta.`{path}` (
+            {columns_ddl}
+        )
+        USING delta
+        PARTITIONED BY ({PARTITION_COLUMN})
+        TBLPROPERTIES ({properties_ddl})
+        """
+    )
 
 
 @dataclass(frozen=True)
@@ -199,6 +232,18 @@ class DeltaSilverMergeWriter:
 
     path: str
     schema: StructType
+
+    def __post_init__(self) -> None:
+        """Strips trailing slash(es) from `path`.
+
+        Delta resolves `s3a://bucket/orders/` and `s3a://bucket/orders`
+        as two different table locations, so a caller passing either
+        convention must not be able to trigger
+        `DELTA_AMBIGUOUS_PATHS_IN_CREATE_TABLE`. Normalizing once here
+        keeps `_ensure_table_exists` and `DeltaTable.forPath` below
+        consistent, regardless of how the caller built `path`.
+        """
+        object.__setattr__(self, "path", self.path.rstrip("/"))
 
     def write(self, collapsed_df: DataFrame) -> None:
         """MERGEs one already-collapsed batch (one row per `order_id`) into Silver.
